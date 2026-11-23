@@ -42,12 +42,20 @@ def load(data: bytes) -> list[CatalogProduct]:
 
 
 def read(slug: str, path: Path | None, s3) -> tuple[bytes, str]:
-    """The catalog bytes and their sha256: from `path` if given, else from the bucket."""
+    """The catalog bytes and their sha256: from `path` if given, else from the bucket.
+
+    A missing bucket setting or an S3 error raises RuntimeError, which the CLI shows as a CliError."""
     if path is not None:
         data = path.read_bytes()
     else:
         bucket = os.environ.get("CARDLEDGER_S3_BUCKET")
         if not bucket:
             raise RuntimeError("CARDLEDGER_S3_BUCKET is not set")
-        data = s3.get_object(Bucket=bucket, Key=catalog_key(slug))["Body"].read()
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        key = catalog_key(slug)
+        try:
+            data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except (BotoCoreError, ClientError) as exc:
+            raise RuntimeError(f"cannot read s3://{bucket}/{key}: {exc}") from exc
     return data, hashlib.sha256(data).hexdigest()

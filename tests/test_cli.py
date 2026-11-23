@@ -4,10 +4,11 @@ import json
 
 import cv2
 import httpx
+import numpy as np
 import pytest
 
 from cardledger_vision import cli, images
-from cardledger_vision.index import Index
+from cardledger_vision.index import Entry, Header, Index, encode
 from cardledger_vision.phash import CARD_SIZE, hash_card
 
 
@@ -35,14 +36,17 @@ def catalog_bytes(products):
 class Server:
     """Serves a PNG of a different card per URL; the URLs in `missing` answer 404."""
 
-    def __init__(self, card_image, missing=()):
+    def __init__(self, card_image, missing=(), bodies=None):
         self.card_image, self.missing, self.requests = card_image, set(missing), []
+        self.bodies = bodies or {}  # url -> the bytes to answer instead of the card
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         self.requests.append(url)
         if url in self.missing:
             return httpx.Response(404)
+        if url in self.bodies:
+            return httpx.Response(200, content=self.bodies[url])
         seed = int(url.rsplit("/", 1)[1].split(".")[0])
         ok, png = cv2.imencode(".png", self.card_image(seed))
         return httpx.Response(200, content=png.tobytes())
@@ -144,15 +148,67 @@ def test_catalog_read_from_s3_and_file(tmp_path):
     assert catalog.read("mtg", path, None)[0] == raw
 
 
+def write_index(tmp_path, slug, game=None):
+    data = encode(Header(game or slug, "t", "x"), [Entry(1, "A", "s", "1", bytes(32))])
+    key = tmp_path / f"vision/v1/{slug}.bin"
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_bytes(data)
+    return data
+
+
 def test_upload_puts_vision_key(tmp_path, monkeypatch):
     monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    key = tmp_path / "vision/v1/mtg.bin"
-    key.parent.mkdir(parents=True)
-    key.write_bytes(b"data")
+    data = write_index(tmp_path, "mtg")
     s3 = FakeS3()
     assert cli.upload(["mtg"], tmp_path, s3) == ["vision/v1/mtg.bin"]
     assert s3.puts[0]["Key"] == "vision/v1/mtg.bin"
-    assert s3.puts[0]["Bucket"] == "bkt" and s3.puts[0]["Body"] == b"data"
+    assert s3.puts[0]["Bucket"] == "bkt" and s3.puts[0]["Body"] == data
+
+
+@pytest.mark.parametrize("content", ["garbage", "other game"])
+def test_upload_refuses_an_invalid_index_or_another_games(tmp_path, monkeypatch, content):
+    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
+    write_index(tmp_path, "mtg")
+    if content == "garbage":
+        (tmp_path / "vision/v1/pokemon.bin").write_bytes(b"data")
+    else:
+        write_index(tmp_path, "pokemon", game="lorcana")
+    s3 = FakeS3()
+    with pytest.raises(cli.CliError, match="pokemon"):
+        cli.upload(["mtg", "pokemon"], tmp_path, s3)
+    assert s3.puts == []  # nothing is uploaded when one file is wrong
+
+
+def test_catalog_s3_error_is_a_cli_error(tmp_path, monkeypatch, capsys):
+    from botocore.exceptions import ClientError
+
+    class Failing:
+        def get_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+
+    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "make_s3", Failing)
+    assert cli.main(["build-index", "--game", "mtg", "--out", str(tmp_path / "out")]) == 1
+    assert "catalog/v1/mtg.json" in capsys.readouterr().out
+
+
+def test_build_index_writes_atomically(card_image, tmp_path, monkeypatch):
+    path = tmp_path / "c.json"
+    path.write_bytes(catalog_bytes([product(1)]))
+    out = tmp_path / "out/vision/v1/mtg.bin"
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"previous")
+    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
+
+    def fail(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli.os, "replace", fail)
+    with pytest.raises(OSError):
+        cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out"),
+                  "--cache", str(tmp_path / "cache")])
+    assert out.read_bytes() == b"previous"
 
 
 def test_upload_without_bucket_fails(tmp_path, monkeypatch, capsys):
@@ -171,3 +227,123 @@ def test_build_index_command_writes_file(card_image, tmp_path, monkeypatch):
                      "--cache", str(tmp_path / "cache")])
     assert code == 0
     assert len(Index.load((tmp_path / "out/vision/v1/mtg.bin").read_bytes())) == 1
+
+
+def test_bad_url_or_undecodable_image_leaves_the_entry_without_hash(card_image, tmp_path, monkeypatch):
+    bad = [product(1), product(2), product(3), product(4)]
+    bad[0]["image_url"] = "https://img.test/\x00x.png"  # httpx.InvalidURL
+    bad[1]["image_url"] = "not a url"
+    server = Server(card_image, bodies={"https://img.test/3.png": b"\x89PNG\r\n\x1a\nbroken"})
+    real, png4 = cv2.imdecode, cv2.imencode(".png", card_image(4))[1].tobytes()
+
+    def imdecode(buf, flags):
+        if np.asarray(buf).tobytes() == png4:
+            raise cv2.error("decoder failure")
+        return real(buf, flags)
+
+    monkeypatch.setattr(cv2, "imdecode", imdecode)
+    data, _ = build("mtg", bad, server, tmp_path)
+    assert list(Index.load(data).has_hash) == [False, False, False, False]
+
+
+def test_only_decodable_images_are_cached(card_image, tmp_path):
+    server = Server(card_image, bodies={"https://img.test/2.png": b"<html>rate limited</html>"})
+    build("mtg", [product(1), product(2)], server, tmp_path)
+    assert len(list((tmp_path / "cache/images").iterdir())) == 1
+    build("mtg", [product(1), product(2)], server, tmp_path)
+    assert server.requests.count("https://img.test/2.png") == 2  # not cached, asked again
+    assert server.requests.count("https://img.test/1.png") == 1
+
+
+def test_corrupt_cached_file_is_fetched_again(card_image, tmp_path):
+    server = Server(card_image)
+    build("mtg", [product(1)], server, tmp_path)
+    (cached,) = (tmp_path / "cache/images").iterdir()
+    cached.write_bytes(b"truncated")
+    data, _ = build("mtg", [product(1)], server, tmp_path)
+    assert server.requests.count("https://img.test/1.png") == 2
+    assert list(Index.load(data).has_hash) == [True]
+    assert cv2.imdecode(np.frombuffer(cached.read_bytes(), np.uint8), cv2.IMREAD_COLOR) is not None
+    assert [p.name for p in cached.parent.iterdir()] == [cached.name]  # no temporary file left
+
+
+def test_large_image_is_asked_only_when_the_primary_fails(card_image, tmp_path):
+    server = Server(card_image, missing={"https://img.test/2.png"})
+    build("mtg", [product(1, large=True), product(2, large=True)], server, tmp_path)
+    assert "https://img.test/large/1.png" not in server.requests
+    assert "https://img.test/large/2.png" in server.requests
+
+
+def test_build_keeps_only_hashes(card_image, tmp_path, monkeypatch):
+    # The images are hashed in the workers: build_index never sees image bytes.
+    monkeypatch.setattr(images, "fetch", lambda *a, **k: pytest.fail("build_index must not collect image bytes"))
+    data, _ = build("mtg", [product(1), product(2)], Server(card_image), tmp_path)
+    assert list(Index.load(data).has_hash) == [True, True]
+
+
+def test_hashing_is_submitted_in_bounded_batches(card_image, tmp_path, monkeypatch):
+    monkeypatch.setattr(images, "BATCH", 2)
+    seen = []
+    real = images._hash_batch
+
+    def spy(urls, *a, **k):
+        seen.append(len(urls))
+        return real(urls, *a, **k)
+
+    monkeypatch.setattr(images, "_hash_batch", spy)
+    data, _ = build("mtg", [product(i) for i in range(1, 6)], Server(card_image), tmp_path)
+    assert seen == [2, 2, 1] and list(Index.load(data).has_hash) == [True] * 5
+
+
+def test_backoff_and_retry_after(sleeps):
+    answers = iter([httpx.Response(429, headers={"Retry-After": "3"}), httpx.Response(503), httpx.Response(503)])
+
+    with httpx.Client(transport=httpx.MockTransport(lambda request: next(answers))) as client:
+        assert images.fetch(["https://backoff-a.test/b.png"], None, client, host_interval=0) == {"https://backoff-a.test/b.png": None}
+    assert sleeps == [3, 1]  # Retry-After, then the second backoff step (a host of its own: no throttle wait)
+
+
+def test_backoff_without_retry_after(sleeps):
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503))) as client:
+        images.fetch(["https://backoff-b.test/c.png"], None, client, host_interval=0)
+    assert sleeps == [0.5, 1]
+
+
+def test_host_interval_option(card_image, tmp_path, monkeypatch):
+    path = tmp_path / "c.json"
+    path.write_bytes(catalog_bytes([product(1)]))
+    got = {}
+    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
+    real = cli.build_index
+
+    def spy(*a, **k):
+        got.update(k)
+        return real(*a, **k)
+
+    monkeypatch.setattr(cli, "build_index", spy)
+    cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out"),
+              "--cache", str(tmp_path / "cache"), "--host-interval", "0.5"])
+    assert got["host_interval"] == 0.5
+
+
+def test_landscape_catalog_image_is_turned_portrait(card_image, tmp_path):
+    card = card_image(1)
+    ok, png = cv2.imencode(".png", cv2.rotate(card, cv2.ROTATE_90_COUNTERCLOCKWISE))
+    server = Server(card_image, bodies={"https://img.test/1.png": png.tobytes()})
+    data, _ = build("mtg", [product(1)], server, tmp_path)
+    expected = hash_card(cv2.resize(card, CARD_SIZE, interpolation=cv2.INTER_AREA))
+    assert Index.load(data).hashes[0].tobytes() == expected
+
+
+def test_transparent_png_is_composited_on_grey(card_image, tmp_path):
+    card = card_image(1)
+    bgra = cv2.cvtColor(card, cv2.COLOR_BGR2BGRA)
+    bgra[:200, :, 3] = 0  # the top is transparent; its colour channels are junk
+    bgra[:200, :, :3] = 0
+    ok, png = cv2.imencode(".png", bgra)
+    server = Server(card_image, bodies={"https://img.test/1.png": png.tobytes()})
+    data, _ = build("mtg", [product(1)], server, tmp_path)
+    grey = card.copy()
+    grey[:200] = 128
+    expected = hash_card(cv2.resize(grey, CARD_SIZE, interpolation=cv2.INTER_AREA))
+    assert Index.load(data).hashes[0].tobytes() == expected

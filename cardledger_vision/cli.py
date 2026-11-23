@@ -8,14 +8,11 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-import cv2
 import httpx
-import numpy as np
 from dotenv import load_dotenv
 
 from . import bench, catalog, images
-from .index import Entry, Header, Index, encode
-from .phash import CARD_SIZE, hash_card
+from .index import Entry, Header, Index, InvalidIndex, encode
 
 GAMES = ("mtg", "pokemon", "lorcana", "onepiece", "yugioh", "riftbound")
 
@@ -48,29 +45,20 @@ def make_s3():
                         region_name=os.environ["CARDLEDGER_S3_REGION"])
 
 
-def _hash(data: bytes | None) -> bytes | None:
-    if data is None:
-        return None
-    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        return None
-    return hash_card(cv2.resize(image, CARD_SIZE, interpolation=cv2.INTER_AREA))
-
-
 def build_index(slug: str, catalog_bytes: bytes, sha256: str, client: httpx.Client, cache_dir: Path,
-                confirm_only: bool = False) -> bytes:
+                confirm_only: bool = False, host_interval: float = images.MIN_INTERVAL) -> bytes:
     """The index of the game's single cards; a card whose image can't be had enters without a hash."""
     start = time.monotonic()
     products = sorted(catalog.load(catalog_bytes), key=lambda p: p.id_product)
     # Large images are fetched only for the products whose normal image failed.
-    primary = images.fetch([p.image_url for p in products if p.image_url], cache_dir, client)
-    retry = [p.image_large_url for p in products if p.image_large_url and _hash(primary.get(p.image_url)) is None]
-    fallback = images.fetch(retry, cache_dir, client)
+    primary = images.fetch_hashes([p.image_url for p in products if p.image_url], cache_dir, client, host_interval)
+    retry = [p.image_large_url for p in products if p.image_large_url and primary.get(p.image_url) is None]
+    fallback = images.fetch_hashes(retry, cache_dir, client, host_interval)
     entries = []
     for p in products:
-        h = _hash(primary.get(p.image_url)) if p.image_url else None
+        h = primary.get(p.image_url) if p.image_url else None
         if h is None and p.image_large_url:
-            h = _hash(fallback.get(p.image_large_url))
+            h = fallback.get(p.image_large_url)
         entries.append(Entry(p.id_product, p.name, p.expansion_code, p.number, h))
     header = Header(slug, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), sha256, confirm_only)
     logger.info("%s: entries=%d with_hash=%d seconds=%.0f", slug, len(entries),
@@ -87,10 +75,20 @@ def upload(slugs: list[str], out: Path, s3=None) -> list[str]:
     missing = [str(path) for path in files.values() if not path.is_file()]
     if missing:
         raise CliError(f"nothing to upload, run build-index first: {', '.join(missing)}")
+    contents = {}
+    for (key, path), slug in zip(files.items(), slugs):
+        data = path.read_bytes()
+        try:
+            game = Index.load(data).header.game
+        except InvalidIndex as exc:
+            raise CliError(f"{path} is not a valid index: {exc}") from exc
+        if game != slug:
+            raise CliError(f"{path} is the index of {game!r}, not {slug!r}")
+        contents[key] = data
     if s3 is None:
         s3 = make_s3()
-    for key, path in files.items():
-        s3.put_object(Bucket=bucket, Key=key, Body=path.read_bytes(), ContentType="application/octet-stream")
+    for key, data in contents.items():
+        s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/octet-stream")
         logger.info("uploaded s3://%s/%s", bucket, key)
     return list(files)
 
@@ -102,10 +100,16 @@ def _build(args) -> None:
     except RuntimeError as exc:
         raise CliError(str(exc)) from exc
     with make_client() as client:
-        index = build_index(args.game, data, sha, client, args.cache, args.confirm_only)
+        index = build_index(args.game, data, sha, client, args.cache, args.confirm_only,
+                            host_interval=args.host_interval)
     path = args.out / index_key(args.game)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(index)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")  # a reader never sees a half-written index
+    try:
+        tmp.write_bytes(index)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     logger.info("%s: written %s", args.game, path)
 
 
@@ -135,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--cache", type=Path, default=Path(".cache"), help="cache folder (default: .cache)")
             command.add_argument("--confirm-only", action="store_true",
                                  help="mark the index as never enough to accept a card without confirmation")
+            command.add_argument("--host-interval", type=float, default=images.MIN_INTERVAL,
+                                 help=f"seconds between two requests to an image host (default: {images.MIN_INTERVAL})")
     command = commands.add_parser("bench", help="measure recognition on synthetic photos of the catalog")
     command.add_argument("--game", required=True, choices=GAMES)
     command.add_argument("--index", required=True, type=Path, help="the game's index file")
