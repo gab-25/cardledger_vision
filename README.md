@@ -24,8 +24,10 @@ and rebuild the indexes with `cardledger-db index`.
 
 `bench` makes synthetic photos (rotation, perspective, light, glare, blur, noise, JPEG) of a seeded sample of the
 catalog images and recognizes each without a set lock and with the product's own set as lock. The table counts
-`ok`, `wrong_certain` (answered `ok` with the wrong product), `in_candidates`, `not_found` and `no_card`, with the
-median and p90 time of `recognize`.
+`ok`, `wrong_certain` (answered `ok` with the wrong product), `in_candidates`, `not_found` and `no_card`, then where
+the right card is among the candidates (1st, 2nd-3rd, 4th+: what the user picks from on a confirm-only index), with
+the median and p90 time of `recognize`. A confirm-only index is measured as if it were not, so `ok` and
+`wrong_certain` still say how often a certain answer would be right.
 
 ```python
 from pathlib import Path
