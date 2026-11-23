@@ -470,3 +470,15 @@ def test_bench_one_games_file_without_game_is_refused(tmp_path, monkeypatch, cap
     monkeypatch.chdir(tmp_path)
     assert cli.main(["bench", option, str(tmp_path / "x")]) == 1
     assert "--game" in capsys.readouterr().out
+
+
+def test_rebuild_reuses_cached_hashes_without_decoding(card_image, tmp_path, monkeypatch):
+    server = Server(card_image)
+    first, _ = build("mtg", [product(1), product(2)], server, tmp_path)
+    assert len(list((tmp_path / "cache" / images.HASHES).iterdir())) == 2
+    decoded = []
+    real = images.decode
+    monkeypatch.setattr(images, "decode", lambda data: decoded.append(1) or real(data))
+    second, _ = build("mtg", [product(1), product(2)], server, tmp_path)
+    assert decoded == [] and len(server.requests) == 2
+    assert Index.load(first).hashes.tobytes() == Index.load(second).hashes.tobytes()

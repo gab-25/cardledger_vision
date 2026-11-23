@@ -136,3 +136,14 @@ def test_bench_command(card_image, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "wrong_certain" in out and "unindexed" in out and "skipped" in out
     assert len(asked) == 2  # only the sampled images
+
+
+def test_parallel_photos_match_the_serial_ones(card_image):
+    from cardledger_vision.bench import _photos
+
+    ok, png = cv2.imencode(".png", framed(card_image, 1))
+    ok, png2 = cv2.imencode(".png", framed(card_image, 2))
+    samples = [("a", png.tobytes()), ("bad", b"not an image"), ("b", png2.tobytes())]
+    rng = random.Random(3)
+    expect = [("a", synth_photo(framed(card_image, 1), rng)), None, ("b", synth_photo(framed(card_image, 2), rng))]
+    assert _photos(samples, 3) == expect
