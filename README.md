@@ -41,5 +41,5 @@ with httpx.Client(follow_redirects=True) as client:
 print(bench.run(index, samples, 42, skipped).table())
 ```
 
-Confirm-only rule: if `wrong_certain` is above 2% for a game, mark the game `confirm_only` in cardledger_database, so
-its index never answers `ok` without confirmation.
+Confirm-only rule: a game whose index is `confirm_only` never answers `ok` without confirmation. In
+cardledger_database every game is confirm-only for now; a game can drop it once its `wrong_certain` is at most 2%.
