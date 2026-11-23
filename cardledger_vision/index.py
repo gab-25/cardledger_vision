@@ -1,15 +1,32 @@
 """Versioned binary index format (little-endian, readable from JavaScript).
 
-Layout:
-    "CLVI" | u16 format=1 | u32 header_len | header JSON (utf-8)
-    u32 n | n x u32 product_id | n x u8 has_hash (padded to a multiple of 4)
-    | n x 32 byte hash (zeros if absent)
-    u32 strings_len | JSON {"names": [...], "sets": [...], "numbers": [...]}
+Byte layout (offsets from the start of the file):
+
+    0               4 bytes   magic "CLVI"
+    4               u16       format version (1)
+    6               u32       header_len
+    10              header_len bytes: header JSON, utf-8, padded with trailing spaces (0x20) so that
+                    10 + header_len + 4 is a multiple of 8
+    10+header_len   u32       n, the number of entries
+    A = 14+header_len  (multiple of 8)
+                    n x u32   product_id
+    A + 4n          n x u8    has_hash (1 = the entry has a hash, 0 = no image)
+    A + 5n          (-5n mod 8) zero bytes, so that the hashes start at a multiple of 8
+    B = A + 5n + pad  (multiple of 8)
+                    n x 32 bytes  hash (see phash.hash_card; all zeros when has_hash is 0)
+    B + 32n         u32       strings_len
+    B + 32n + 4     strings_len bytes: JSON {"names": [...], "sets": [...], "numbers": [...]}, n strings each
+    end of file (no trailing bytes)
+
+The alignment lets a JavaScript reader view the ids as a Uint32Array and the hashes as a Uint8Array or
+BigUint64Array directly on the file's ArrayBuffer. The header JSON holds "game", "built_at", "catalog_sha256",
+"confirm_only" and "thresholds" ({"identity_max", "name_gap", "printing_gap"}); readers ignore unknown keys and
+use the defaults for missing optional ones.
 """
 
 import json
 import struct
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import numpy as np
 
@@ -51,17 +68,23 @@ def _json(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+_PREFIX = 10  # magic, version, header_len
+
+
 def _pad(n: int) -> int:
-    return -n % 4
+    """Zero bytes after has_hash, so that the hashes start 8-aligned (the ids block is)."""
+    return -(5 * n) % 8
 
 
 def encode(header: Header, entries: list[Entry]) -> bytes:
     n = len(entries)
     head = _json(asdict(header))
+    head += b" " * (-(_PREFIX + len(head) + 4) % 8)  # the ids block starts 8-aligned
+    for e in entries:
+        if e.hash is not None and len(e.hash) != HASH_BYTES:
+            raise ValueError(f"product {e.product_id}: hash must be {HASH_BYTES} bytes, not {len(e.hash)}")
     has_hash = bytes(1 if e.hash is not None else 0 for e in entries)
     hashes = b"".join(e.hash if e.hash is not None else bytes(HASH_BYTES) for e in entries)
-    if len(hashes) != n * HASH_BYTES:
-        raise ValueError(f"every hash must be {HASH_BYTES} bytes")
     strings = _json(
         {
             "names": [e.name for e in entries],
@@ -108,6 +131,24 @@ def _loads(raw: bytes, what: str):
         raise InvalidIndex(f"invalid {what} JSON") from exc
 
 
+def _known(cls, raw) -> dict:
+    """The keys of `raw` that are fields of the dataclass `cls` (unknown keys come from newer builders)."""
+    if not isinstance(raw, dict):
+        raise InvalidIndex(f"invalid {cls.__name__.lower()}")
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in raw.items() if k in names}
+
+
+def _header(raw) -> Header:
+    known = _known(Header, raw)
+    try:
+        if "thresholds" in known:
+            known["thresholds"] = Thresholds(**_known(Thresholds, known["thresholds"]))
+        return Header(**known)
+    except TypeError as exc:  # a required key is missing
+        raise InvalidIndex("invalid header") from exc
+
+
 class Index:
     header: Header
     ids: np.ndarray
@@ -128,12 +169,7 @@ class Index:
         (version,) = struct.unpack("<H", r.take(2))
         if version != FORMAT_VERSION:
             raise InvalidIndex(f"unsupported format version {version}")
-        raw_header = _loads(r.take(r.u32()), "header")
-        try:
-            raw_header["thresholds"] = Thresholds(**raw_header["thresholds"])
-            header = Header(**raw_header)
-        except (TypeError, KeyError) as exc:
-            raise InvalidIndex("invalid header") from exc
+        header = _header(_loads(r.take(r.u32()), "header"))
 
         n = r.u32()
         ids = np.frombuffer(r.take(n * 4), dtype="<u4").astype(np.uint32)
