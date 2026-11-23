@@ -5,6 +5,8 @@ from cardledger_vision.phash import CARD_SIZE
 
 _WORK_HEIGHT = 1000
 _MIN_AREA_RATIO = 0.15
+_CARD_RATIO = 63 / 88  # short side / long side
+_RATIO_TOLERANCE = 0.25  # a quad whose side ratio is further than 25% from a card's is not a card
 
 
 def _order_corners(pts: np.ndarray) -> np.ndarray:
@@ -46,8 +48,13 @@ def detect(photo: np.ndarray) -> np.ndarray | None:
     else:
         quad = cv2.boxPoints(cv2.minAreaRect(best)).astype(np.float32)
     quad = _order_corners(quad)
-    width = np.linalg.norm(quad[1] - quad[0])
-    height = np.linalg.norm(quad[2] - quad[1])
+    if not cv2.isContourConvex(quad.reshape(-1, 1, 2)):
+        return None
+    sides = np.linalg.norm(quad - np.roll(quad, -1, axis=0), axis=1)
+    width, height = (sides[0] + sides[2]) / 2, (sides[1] + sides[3]) / 2  # averaged opposite sides
+    ratio = min(width, height) / max(width, height)
+    if abs(ratio - _CARD_RATIO) > _RATIO_TOLERANCE * _CARD_RATIO:
+        return None
     if width > height:
         quad = np.roll(quad, -1, axis=0)
 
