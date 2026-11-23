@@ -13,8 +13,8 @@ import httpx
 import numpy as np
 from dotenv import load_dotenv
 
-from . import catalog, images
-from .index import Entry, Header, encode
+from . import bench, catalog, images
+from .index import Entry, Header, Index, encode
 from .phash import CARD_SIZE, hash_card
 
 GAMES = ("mtg", "pokemon", "lorcana", "onepiece", "yugioh", "riftbound")
@@ -109,6 +109,19 @@ def _build(args) -> None:
     logger.info("%s: written %s", args.game, path)
 
 
+def _bench(args) -> None:
+    try:
+        data, _ = catalog.read(args.game, args.catalog, None if args.catalog else make_s3())
+        index = Index.load(args.index.read_bytes())
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise CliError(str(exc)) from exc
+    products = catalog.load(data)
+    urls = [p.image_large_url or p.image_url for p in products if p.image_large_url or p.image_url]
+    with make_client() as client:
+        fetched = images.fetch(urls, args.cache, client)
+    print(bench.run(index, products, fetched, args.size, args.seed).table())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cardledger-vision")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -122,6 +135,13 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--cache", type=Path, default=Path(".cache"), help="cache folder (default: .cache)")
             command.add_argument("--confirm-only", action="store_true",
                                  help="mark the index as never enough to accept a card without confirmation")
+    command = commands.add_parser("bench", help="measure recognition on synthetic photos of the catalog")
+    command.add_argument("--game", required=True, choices=GAMES)
+    command.add_argument("--index", required=True, type=Path, help="the game's index file")
+    command.add_argument("--catalog", type=Path, help="local catalog file (default: read it from the bucket)")
+    command.add_argument("--cache", type=Path, default=Path(".cache"), help="cache folder (default: .cache)")
+    command.add_argument("--size", type=int, default=200, help="photos to make (default: 200)")
+    command.add_argument("--seed", type=int, default=42, help="sample and photo seed (default: 42)")
     args = parser.parse_args(argv)
 
     handler = logging.StreamHandler(sys.stdout)
@@ -132,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv(Path(".env"))  # the working directory's .env, without overriding the environment
         if args.command == "build-index":
             _build(args)
+        elif args.command == "bench":
+            _bench(args)
         else:
             upload([args.game], args.out)
         return 0
