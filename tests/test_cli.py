@@ -7,6 +7,7 @@ import httpx
 import numpy as np
 import pytest
 
+import cardledger_vision
 from cardledger_vision import cli, images
 from cardledger_vision.index import Entry, Header, Index, encode
 from cardledger_vision.phash import CARD_SIZE, hash_card
@@ -59,7 +60,7 @@ def build(slug, products, server, tmp_path, **kw):
     raw = catalog_bytes(products)
     sha = hashlib.sha256(raw).hexdigest()
     with server.client() as client:
-        return cli.build_index(slug, raw, sha, client, tmp_path / "cache", **kw), sha
+        return cardledger_vision.build_index(slug, raw, sha, client, tmp_path / "cache", **kw), sha
 
 
 def test_only_singles_enter_the_index(card_image, tmp_path):
@@ -482,3 +483,7 @@ def test_rebuild_reuses_cached_hashes_without_decoding(card_image, tmp_path, mon
     second, _ = build("mtg", [product(1), product(2)], server, tmp_path)
     assert decoded == [] and len(server.requests) == 2
     assert Index.load(first).hashes.tobytes() == Index.load(second).hashes.tobytes()
+
+
+def test_index_key_is_the_bucket_path():
+    assert cardledger_vision.index_key("mtg") == "vision/v1/mtg.bin"

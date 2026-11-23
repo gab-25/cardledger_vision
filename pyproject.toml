@@ -1,6 +1,6 @@
 [project]
 name = "cardledger-vision"
-version = "0.1.0"
+version = "0.2.0"
 description = "Recognizes trading cards in photos by perceptual hash"
 requires-python = ">=3.14"
 license = { text = "GPL-3.0-only" }

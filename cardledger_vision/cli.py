@@ -6,15 +6,14 @@ import argparse
 import logging
 import os
 import sys
-import time
-from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 
 from . import bench, catalog, images
-from .index import Entry, Header, Index, InvalidIndex, encode
+from .build import build_index, index_key
+from .index import Index, InvalidIndex
 
 GAMES = ("mtg", "pokemon", "lorcana", "onepiece", "yugioh", "riftbound")
 
@@ -23,10 +22,6 @@ logger = logging.getLogger("cardledger_vision")
 
 class CliError(Exception):
     """A problem to show to the user without a traceback."""
-
-
-def index_key(slug: str) -> str:
-    return f"vision/v1/{slug}.bin"
 
 
 def make_client() -> httpx.Client:
@@ -45,27 +40,6 @@ def make_s3():
                         aws_access_key_id=os.environ["CARDLEDGER_S3_ACCESS_KEY_ID"],
                         aws_secret_access_key=os.environ["CARDLEDGER_S3_SECRET_ACCESS_KEY"],
                         region_name=os.environ["CARDLEDGER_S3_REGION"])
-
-
-def build_index(slug: str, catalog_bytes: bytes, sha256: str, client: httpx.Client, cache_dir: Path,
-                confirm_only: bool = False, host_interval: float = images.MIN_INTERVAL) -> bytes:
-    """The index of the game's single cards; a card whose image can't be had enters without a hash."""
-    start = time.monotonic()
-    products = sorted(catalog.load(catalog_bytes), key=lambda p: p.id_product)
-    # Large images are fetched only for the products whose normal image failed.
-    primary = images.fetch_hashes([p.image_url for p in products if p.image_url], cache_dir, client, host_interval)
-    retry = [p.image_large_url for p in products if p.image_large_url and primary.get(p.image_url) is None]
-    fallback = images.fetch_hashes(retry, cache_dir, client, host_interval)
-    entries = []
-    for p in products:
-        h = primary.get(p.image_url) if p.image_url else None
-        if h is None and p.image_large_url:
-            h = fallback.get(p.image_large_url)
-        entries.append(Entry(p.id_product, p.name, p.expansion_code, p.number, h))
-    header = Header(slug, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), sha256, confirm_only)
-    logger.info("%s: entries=%d with_hash=%d seconds=%.0f", slug, len(entries),
-                sum(e.hash is not None for e in entries), time.monotonic() - start)
-    return encode(header, entries)
 
 
 def upload(slugs: list[str], out: Path, s3=None) -> list[str]:

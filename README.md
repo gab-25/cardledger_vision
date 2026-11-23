@@ -4,6 +4,21 @@ Python library that recognizes trading cards in photos by perceptual hash (256-b
 
 Commands: `uv sync`, `uv run pytest -q`.
 
+## Who builds the published indexes
+
+The indexes in the bucket are built by `cardledger-db generate` in
+[cardledger_database](https://github.com/gab-25/cardledger_database), right after each catalog, with this library's
+`build_index`; `cardledger-db upload` uploads the catalog and its index together. Its `uv.lock` pins a tag of this
+repository: after changing the hash, the index format or the thresholds, tag a new version and update the pin there.
+The commands below stay for development: build an index, measure it with `bench`, try a change.
+
+```python
+from cardledger_vision import build_index, index_key
+
+index = build_index("mtg", catalog_bytes, catalog_sha256, httpx_client, cache_dir, confirm_only=False)
+# write it to out / index_key("mtg"), i.e. out/vision/v1/mtg.bin
+```
+
 ## Bucket settings
 
 The commands read the bucket settings from the environment or from a `.env` file in the working directory
