@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 
 import cv2
@@ -8,8 +7,8 @@ import numpy as np
 import pytest
 
 import cardledger_vision
-from cardledger_vision import cli, images
-from cardledger_vision.index import Entry, Header, Index, encode
+from cardledger_vision import images
+from cardledger_vision.index import Index
 from cardledger_vision.phash import CARD_SIZE, hash_card
 
 
@@ -120,116 +119,6 @@ def test_fetch_retries_three_times_and_waits_between_requests(sleeps):
     assert len(calls) == 3
 
 
-class FakeS3:
-    def __init__(self, objects=None):
-        self.objects, self.puts, self.gets = objects or {}, [], []
-
-    def get_object(self, Bucket, Key):
-        self.gets.append((Bucket, Key))
-        return {"Body": io.BytesIO(self.objects[Key])}
-
-    def put_object(self, **kw):
-        self.puts.append(kw)
-
-
-def test_catalog_read_from_s3_and_file(tmp_path):
-    from cardledger_vision import catalog
-
-    raw = catalog_bytes([product(1)])
-    s3 = FakeS3({"catalog/v1/mtg.json": raw})
-    monkey = pytest.MonkeyPatch()
-    monkey.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    try:
-        assert catalog.read("mtg", None, s3) == (raw, hashlib.sha256(raw).hexdigest())
-    finally:
-        monkey.undo()
-    assert s3.gets == [("bkt", "catalog/v1/mtg.json")]
-    path = tmp_path / "c.json"
-    path.write_bytes(raw)
-    assert catalog.read("mtg", path, None)[0] == raw
-
-
-def write_index(tmp_path, slug, game=None):
-    data = encode(Header(game or slug, "t", "x"), [Entry(1, "A", "s", "1", bytes(32))])
-    key = tmp_path / f"vision/v1/{slug}.bin"
-    key.parent.mkdir(parents=True, exist_ok=True)
-    key.write_bytes(data)
-    return data
-
-
-def test_upload_puts_vision_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    data = write_index(tmp_path, "mtg")
-    s3 = FakeS3()
-    assert cli.upload(["mtg"], tmp_path, s3) == ["vision/v1/mtg.bin"]
-    assert s3.puts[0]["Key"] == "vision/v1/mtg.bin"
-    assert s3.puts[0]["Bucket"] == "bkt" and s3.puts[0]["Body"] == data
-
-
-@pytest.mark.parametrize("content", ["garbage", "other game"])
-def test_upload_refuses_an_invalid_index_or_another_games(tmp_path, monkeypatch, content):
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    write_index(tmp_path, "mtg")
-    if content == "garbage":
-        (tmp_path / "vision/v1/pokemon.bin").write_bytes(b"data")
-    else:
-        write_index(tmp_path, "pokemon", game="lorcana")
-    s3 = FakeS3()
-    with pytest.raises(cli.CliError, match="pokemon"):
-        cli.upload(["mtg", "pokemon"], tmp_path, s3)
-    assert s3.puts == []  # nothing is uploaded when one file is wrong
-
-
-def test_catalog_s3_error_is_a_cli_error(tmp_path, monkeypatch, capsys):
-    from botocore.exceptions import ClientError
-
-    class Failing:
-        def get_object(self, Bucket, Key):
-            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
-
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "make_s3", Failing)
-    assert cli.main(["build-index", "--game", "mtg", "--out", str(tmp_path / "out")]) == 1
-    assert "catalog/v1/mtg.json" in capsys.readouterr().out
-
-
-def test_build_index_writes_atomically(card_image, tmp_path, monkeypatch):
-    path = tmp_path / "c.json"
-    path.write_bytes(catalog_bytes([product(1)]))
-    out = tmp_path / "out/vision/v1/mtg.bin"
-    out.parent.mkdir(parents=True)
-    out.write_bytes(b"previous")
-    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
-
-    def fail(src, dst):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(cli.os, "replace", fail)
-    with pytest.raises(OSError):
-        cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out"),
-                  "--cache", str(tmp_path / "cache")])
-    assert out.read_bytes() == b"previous"
-
-
-def test_upload_without_bucket_fails(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("CARDLEDGER_S3_BUCKET", raising=False)
-    monkeypatch.chdir(tmp_path)  # no .env here
-    assert cli.main(["upload", "--game", "mtg", "--out", str(tmp_path)]) != 0
-    assert "CARDLEDGER_S3_BUCKET" in capsys.readouterr().out
-
-
-def test_build_index_command_writes_file(card_image, tmp_path, monkeypatch):
-    path = tmp_path / "c.json"
-    path.write_bytes(catalog_bytes([product(1)]))
-    server = Server(card_image)
-    monkeypatch.setattr(cli, "make_client", server.client)
-    code = cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out"),
-                     "--cache", str(tmp_path / "cache")])
-    assert code == 0
-    assert len(Index.load((tmp_path / "out/vision/v1/mtg.bin").read_bytes())) == 1
-
-
 def test_bad_url_or_undecodable_image_leaves_the_entry_without_hash(card_image, tmp_path, monkeypatch):
     bad = [product(1), product(2), product(3), product(4)]
     bad[0]["image_url"] = "https://img.test/\x00x.png"  # httpx.InvalidURL
@@ -310,23 +199,6 @@ def test_backoff_without_retry_after(sleeps):
     assert sleeps == [0.5, 1]
 
 
-def test_host_interval_option(card_image, tmp_path, monkeypatch):
-    path = tmp_path / "c.json"
-    path.write_bytes(catalog_bytes([product(1)]))
-    got = {}
-    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
-    real = cli.build_index
-
-    def spy(*a, **k):
-        got.update(k)
-        return real(*a, **k)
-
-    monkeypatch.setattr(cli, "build_index", spy)
-    cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out"),
-              "--cache", str(tmp_path / "cache"), "--host-interval", "0.5"])
-    assert got["host_interval"] == 0.5
-
-
 def test_landscape_catalog_image_is_turned_portrait(card_image, tmp_path):
     card = card_image(1)
     ok, png = cv2.imencode(".png", cv2.rotate(card, cv2.ROTATE_90_COUNTERCLOCKWISE))
@@ -350,52 +222,6 @@ def test_transparent_png_is_composited_on_grey(card_image, tmp_path):
     assert Index.load(data).hashes[0].tobytes() == expected
 
 
-class Bucket:
-    """An S3 client serving one catalog per game; the games in `missing` have none."""
-
-    def __init__(self, missing=()):
-        self.missing, self.keys = set(missing), []
-
-    def get_object(self, Bucket, Key):
-        from botocore.exceptions import ClientError
-
-        self.keys.append(Key)
-        if any(Key == f"catalog/v1/{slug}.json" for slug in self.missing):
-            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
-        return {"Body": io.BytesIO(catalog_bytes([product(1)]))}
-
-
-def build_all(card_image, tmp_path, monkeypatch, bucket, argv):
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "make_s3", lambda: bucket)
-    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
-    return cli.main(["build-index", *argv, "--out", str(tmp_path / "out"), "--cache", str(tmp_path / "cache")])
-
-
-@pytest.mark.parametrize("argv", [[], ["--game", "all"]])
-def test_build_index_without_game_builds_every_game(card_image, tmp_path, monkeypatch, argv):
-    bucket = Bucket()
-    assert build_all(card_image, tmp_path, monkeypatch, bucket, argv) == 0
-    assert bucket.keys == [f"catalog/v1/{slug}.json" for slug in cli.GAMES]
-    for slug in cli.GAMES:
-        assert Index.load((tmp_path / f"out/vision/v1/{slug}.bin").read_bytes()).header.game == slug
-
-
-def test_a_failing_game_does_not_stop_the_others(card_image, tmp_path, monkeypatch, capsys):
-    assert build_all(card_image, tmp_path, monkeypatch, Bucket(missing={"lorcana"}), []) == 1
-    assert "build-index failed for: lorcana" in capsys.readouterr().out
-    assert not (tmp_path / "out/vision/v1/lorcana.bin").exists()
-    assert all((tmp_path / f"out/vision/v1/{slug}.bin").is_file() for slug in cli.GAMES if slug != "lorcana")
-
-
-def test_catalog_without_game_is_refused(tmp_path, monkeypatch, capsys):
-    path = tmp_path / "c.json"
-    path.write_bytes(catalog_bytes([product(1)]))
-    assert cli.main(["build-index", "--catalog", str(path), "--out", str(tmp_path / "out")]) == 1
-    assert "--game" in capsys.readouterr().out
-
-
 def test_ctrl_c_drops_the_queued_downloads(tmp_path):
     """The interrupt reaches the main thread from the first URL; the busy workers give up and the queue is dropped."""
     requests = []
@@ -414,65 +240,6 @@ def test_ctrl_c_drops_the_queued_downloads(tmp_path):
     assert not images._cancel.is_set()  # the next fetch works again
 
 
-def test_ctrl_c_exits_without_traceback(tmp_path, monkeypatch, capsys):
-    path = tmp_path / "c.json"
-    path.write_bytes(catalog_bytes([product(1)]))
-
-    def interrupted(*a, **k):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(cli, "build_index", interrupted)
-    assert cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out")]) == 130
-    assert "interrupted" in capsys.readouterr().out
-    assert not (tmp_path / "out/vision/v1/mtg.bin").exists()
-
-
-@pytest.mark.parametrize("argv", [[], ["--game", "all"]])
-def test_upload_without_game_uploads_every_game(tmp_path, monkeypatch, argv):
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    monkeypatch.chdir(tmp_path)
-    for slug in cli.GAMES:
-        write_index(tmp_path, slug)
-    s3 = FakeS3()
-    monkeypatch.setattr(cli, "make_s3", lambda: s3)
-    assert cli.main(["upload", *argv, "--out", str(tmp_path)]) == 0
-    assert [put["Key"] for put in s3.puts] == [cli.index_key(slug) for slug in cli.GAMES]
-
-
-def test_upload_without_game_uploads_nothing_when_one_is_missing(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
-    monkeypatch.chdir(tmp_path)
-    for slug in cli.GAMES[1:]:
-        write_index(tmp_path, slug)
-    s3 = FakeS3()
-    monkeypatch.setattr(cli, "make_s3", lambda: s3)
-    assert cli.main(["upload", "--out", str(tmp_path)]) == 1
-    assert cli.GAMES[0] in capsys.readouterr().out and s3.puts == []
-
-
-def test_bench_without_game_benches_every_game(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "make_s3", lambda: Bucket(missing={"lorcana"}))
-    benched = []
-
-    def bench_game(slug, args, s3):
-        if slug == "lorcana":
-            raise cli.CliError("no catalog")
-        benched.append((slug, args.index or args.out / cli.index_key(slug)))
-
-    monkeypatch.setattr(cli, "_bench_game", bench_game)
-    assert cli.main(["bench", "--out", str(tmp_path / "out")]) == 1
-    assert benched == [(slug, tmp_path / "out" / cli.index_key(slug)) for slug in cli.GAMES if slug != "lorcana"]
-    assert "bench failed for: lorcana" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("option", ["--index", "--catalog"])
-def test_bench_one_games_file_without_game_is_refused(tmp_path, monkeypatch, capsys, option):
-    monkeypatch.chdir(tmp_path)
-    assert cli.main(["bench", option, str(tmp_path / "x")]) == 1
-    assert "--game" in capsys.readouterr().out
-
-
 def test_rebuild_reuses_cached_hashes_without_decoding(card_image, tmp_path, monkeypatch):
     server = Server(card_image)
     first, _ = build("mtg", [product(1), product(2)], server, tmp_path)
@@ -485,5 +252,5 @@ def test_rebuild_reuses_cached_hashes_without_decoding(card_image, tmp_path, mon
     assert Index.load(first).hashes.tobytes() == Index.load(second).hashes.tobytes()
 
 
-def test_index_key_is_the_bucket_path():
+def test_index_key_is_the_published_path():
     assert cardledger_vision.index_key("mtg") == "vision/v1/mtg.bin"

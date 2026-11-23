@@ -2,7 +2,6 @@ import random
 
 import cv2
 
-from cardledger_vision import cli
 from cardledger_vision.bench import collect, run, sample, synth_photo
 from cardledger_vision.catalog import CatalogProduct
 from cardledger_vision.index import Entry, Header, Index, encode
@@ -106,36 +105,6 @@ def test_collect_fetches_only_the_sample_and_replacements():
     for p, _ in got:  # the large image when it works, else the normal one
         assert (p.image_large_url in asked and p.image_large_url not in broken) or p.image_url not in broken
     assert collect(products, 10, 5, fetch)[0] == got  # deterministic
-
-
-def test_bench_command(card_image, tmp_path, monkeypatch, capsys):
-    import json
-    index, products, images = make(card_image)
-    products.append(CatalogProduct(99, "No image", "set", "99", None, None))
-    (tmp_path / "mtg.bin").write_bytes(encode(index.header, [
-        Entry(int(index.ids[i]), index.names[i], index.sets[i], index.numbers[i], index.hashes[i].tobytes())
-        for i in range(len(index))]))
-    cat = tmp_path / "c.json"
-    cat.write_text(json.dumps({"expansions": [], "products": [
-        {"id_product": p.id_product, "name": p.name, "expansion_code": "set", "number": p.number,
-         "image_url": None, "image_large_url": p.image_large_url, "category_name": "Magic Singles"}
-        for p in products]}))
-    import httpx
-
-    asked = []
-
-    def handler(request):
-        asked.append(str(request.url))
-        return httpx.Response(200, content=images[str(request.url)])
-
-    monkeypatch.setattr(cli, "make_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
-    monkeypatch.setattr("cardledger_vision.images.sleep", lambda s: None)
-    code = cli.main(["bench", "--game", "mtg", "--index", str(tmp_path / "mtg.bin"), "--catalog", str(cat),
-                     "--cache", str(tmp_path / "cache"), "--size", "2", "--host-interval", "0"])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "wrong_certain" in out and "unindexed" in out and "skipped" in out
-    assert len(asked) == 2  # only the sampled images
 
 
 def test_parallel_photos_match_the_serial_ones(card_image):

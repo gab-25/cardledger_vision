@@ -4,10 +4,7 @@ version = "0.1.0"
 description = "Recognizes trading cards in photos by perceptual hash"
 requires-python = ">=3.14"
 license = { text = "GPL-3.0-only" }
-dependencies = ["numpy", "opencv-python-headless", "httpx", "boto3", "python-dotenv"]
-
-[project.scripts]
-cardledger-vision = "cardledger_vision.cli:run"
+dependencies = ["numpy", "opencv-python-headless", "httpx"]
 
 [dependency-groups]
 dev = ["pytest"]

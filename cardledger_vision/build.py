@@ -1,5 +1,5 @@
-"""Builds a game's index from its catalog: the entry point for the programs that make the indexes
-(`cardledger-vision build-index` and `cardledger-db generate`)."""
+"""Builds a game's index from its catalog: the entry point of `cardledger-db generate`, which makes the published
+indexes."""
 
 import logging
 import time
