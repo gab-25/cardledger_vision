@@ -94,15 +94,34 @@ def upload(slugs: list[str], out: Path, s3=None) -> list[str]:
 
 
 def _build(args) -> None:
+    """Builds the index of `--game`, or of every game when it is left out or is `all`."""
+    slugs = GAMES if args.game in (None, "all") else (args.game,)
+    if args.catalog and len(slugs) > 1:
+        raise CliError("--catalog is one game's catalog: pass --game too")
     s3 = None if args.catalog else make_s3()
+    if len(slugs) == 1:
+        _build_game(slugs[0], args, s3)
+        return
+    failed = []
+    for slug in slugs:  # one game's failure doesn't stop the others
+        try:
+            _build_game(slug, args, s3)
+        except CliError as exc:
+            logger.error("%s: %s", slug, exc)
+            failed.append(slug)
+    if failed:
+        raise CliError(f"build-index failed for: {', '.join(failed)}")
+
+
+def _build_game(slug: str, args, s3) -> None:
     try:
-        data, sha = catalog.read(args.game, args.catalog, s3)
+        data, sha = catalog.read(slug, args.catalog, s3)
     except RuntimeError as exc:
         raise CliError(str(exc)) from exc
     with make_client() as client:
-        index = build_index(args.game, data, sha, client, args.cache, args.confirm_only,
+        index = build_index(slug, data, sha, client, args.cache, args.confirm_only,
                             host_interval=args.host_interval)
-    path = args.out / index_key(args.game)
+    path = args.out / index_key(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")  # a reader never sees a half-written index
     try:
@@ -110,7 +129,7 @@ def _build(args) -> None:
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
-    logger.info("%s: written %s", args.game, path)
+    logger.info("%s: written %s", slug, path)
 
 
 def _bench(args) -> None:
@@ -132,10 +151,14 @@ def main(argv: list[str] | None = None) -> int:
     for name, help in (("build-index", "build a game's index from its catalog"),
                        ("upload", "upload a game's index to the S3 bucket")):
         command = commands.add_parser(name, help=help)
-        command.add_argument("--game", required=True, choices=GAMES)
+        if name == "build-index":
+            command.add_argument("--game", choices=(*GAMES, "all"), help="the game to build (default: all)")
+        else:
+            command.add_argument("--game", required=True, choices=GAMES)
         command.add_argument("--out", type=Path, default=Path("out"), help="output folder (default: out)")
         if name == "build-index":
-            command.add_argument("--catalog", type=Path, help="local catalog file (default: read it from the bucket)")
+            command.add_argument("--catalog", type=Path,
+                                 help="local catalog file of --game (default: read it from the bucket)")
             command.add_argument("--cache", type=Path, default=Path(".cache"), help="cache folder (default: .cache)")
             command.add_argument("--confirm-only", action="store_true",
                                  help="mark the index as never enough to accept a card without confirmation")
@@ -168,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         logger.error("%s", exc)
         return 1
+    except KeyboardInterrupt:
+        logger.error("interrupted: no index written for the game in progress (the image cache is kept)")
+        return 130
     finally:
         logger.removeHandler(handler)
 

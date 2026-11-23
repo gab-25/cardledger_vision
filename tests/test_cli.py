@@ -347,3 +347,80 @@ def test_transparent_png_is_composited_on_grey(card_image, tmp_path):
     grey[:200] = 128
     expected = hash_card(cv2.resize(grey, CARD_SIZE, interpolation=cv2.INTER_AREA))
     assert Index.load(data).hashes[0].tobytes() == expected
+
+
+class Bucket:
+    """An S3 client serving one catalog per game; the games in `missing` have none."""
+
+    def __init__(self, missing=()):
+        self.missing, self.keys = set(missing), []
+
+    def get_object(self, Bucket, Key):
+        from botocore.exceptions import ClientError
+
+        self.keys.append(Key)
+        if any(Key == f"catalog/v1/{slug}.json" for slug in self.missing):
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+        return {"Body": io.BytesIO(catalog_bytes([product(1)]))}
+
+
+def build_all(card_image, tmp_path, monkeypatch, bucket, argv):
+    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "make_s3", lambda: bucket)
+    monkeypatch.setattr(cli, "make_client", Server(card_image).client)
+    return cli.main(["build-index", *argv, "--out", str(tmp_path / "out"), "--cache", str(tmp_path / "cache")])
+
+
+@pytest.mark.parametrize("argv", [[], ["--game", "all"]])
+def test_build_index_without_game_builds_every_game(card_image, tmp_path, monkeypatch, argv):
+    bucket = Bucket()
+    assert build_all(card_image, tmp_path, monkeypatch, bucket, argv) == 0
+    assert bucket.keys == [f"catalog/v1/{slug}.json" for slug in cli.GAMES]
+    for slug in cli.GAMES:
+        assert Index.load((tmp_path / f"out/vision/v1/{slug}.bin").read_bytes()).header.game == slug
+
+
+def test_a_failing_game_does_not_stop_the_others(card_image, tmp_path, monkeypatch, capsys):
+    assert build_all(card_image, tmp_path, monkeypatch, Bucket(missing={"lorcana"}), []) == 1
+    assert "build-index failed for: lorcana" in capsys.readouterr().out
+    assert not (tmp_path / "out/vision/v1/lorcana.bin").exists()
+    assert all((tmp_path / f"out/vision/v1/{slug}.bin").is_file() for slug in cli.GAMES if slug != "lorcana")
+
+
+def test_catalog_without_game_is_refused(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "c.json"
+    path.write_bytes(catalog_bytes([product(1)]))
+    assert cli.main(["build-index", "--catalog", str(path), "--out", str(tmp_path / "out")]) == 1
+    assert "--game" in capsys.readouterr().out
+
+
+def test_ctrl_c_drops_the_queued_downloads(tmp_path):
+    """The interrupt reaches the main thread from the first URL; the busy workers give up and the queue is dropped."""
+    requests = []
+
+    def handler(request):
+        requests.append(str(request.url))
+        if str(request.url).endswith("/0.png"):
+            raise KeyboardInterrupt
+        assert images._cancel.wait(5), "the pool was not cancelled"
+        return httpx.Response(503)  # would be retried, were it not cancelled
+
+    urls = [f"https://cancel.test/{i}.png" for i in range(200)]
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client, pytest.raises(KeyboardInterrupt):
+        images.fetch_hashes(urls, tmp_path / "cache", client, host_interval=0)
+    assert len(requests) <= images.MAX_PARALLEL + 1  # each busy worker made one attempt, the queue none
+    assert not images._cancel.is_set()  # the next fetch works again
+
+
+def test_ctrl_c_exits_without_traceback(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "c.json"
+    path.write_bytes(catalog_bytes([product(1)]))
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "build_index", interrupted)
+    assert cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out")]) == 130
+    assert "interrupted" in capsys.readouterr().out
+    assert not (tmp_path / "out/vision/v1/mtg.bin").exists()

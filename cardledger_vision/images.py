@@ -6,7 +6,9 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,13 +27,36 @@ MAX_RETRY_AFTER = 60  # a longer Retry-After is capped
 BATCH = 1000  # URLs submitted to the workers at once
 BACKGROUND = 128  # grey under the transparent pixels of a PNG
 
-sleep = time.sleep  # patched by the tests
-clock = time.monotonic
-
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _next_slot: dict[str, float] = {}
+_cancel = threading.Event()  # set while an interrupted download pool winds down: the workers stop early
+
+
+def sleep(seconds: float) -> None:  # patched by the tests
+    """Waits, but returns at once when the downloads are cancelled."""
+    _cancel.wait(seconds)
+
+
+clock = time.monotonic
+
+
+@contextmanager
+def _pool() -> Iterator[ThreadPoolExecutor]:
+    """The download workers. On Ctrl+C (or any error) the queued URLs are dropped and the running workers give up
+    at their next wait or attempt, so the interruption doesn't wait for the whole batch."""
+    pool = ThreadPoolExecutor(MAX_PARALLEL)
+    try:
+        yield pool
+    except BaseException:
+        _cancel.set()
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            _cancel.clear()
+        raise
+    pool.shutdown(wait=True)
 
 
 def _wait_turn(host: str, interval: float) -> None:
@@ -62,6 +87,8 @@ def _download(url: str, client: httpx.Client, interval: float) -> bytes | None:
     host = urlsplit(url).netloc
     for attempt in range(ATTEMPTS):
         _wait_turn(host, interval)
+        if _cancel.is_set():
+            return None
         wait = BACKOFF[attempt]
         try:
             response = client.get(url)
@@ -159,7 +186,7 @@ def fetch_hashes(urls: list[str], cache_dir: Path | None, client: httpx.Client,
     the 32-byte hash is kept; the URLs go to the workers in batches of BATCH."""
     unique = list(dict.fromkeys(urls))
     out: dict[str, bytes | None] = {}
-    with ThreadPoolExecutor(MAX_PARALLEL) as pool:
+    with _pool() as pool:
         for start in range(0, len(unique), BATCH):
             batch = unique[start:start + BATCH]
             out.update(zip(batch, _hash_batch(batch, pool, cache_dir, client, host_interval)))
@@ -174,5 +201,5 @@ def fetch(urls: list[str], cache_dir: Path | None, client: httpx.Client,
     def work(data: bytes, image: np.ndarray) -> bytes:
         return data
 
-    with ThreadPoolExecutor(MAX_PARALLEL) as pool:
+    with _pool() as pool:
         return dict(zip(unique, pool.map(lambda url: _safe(url, work, cache_dir, client, host_interval), unique)))
