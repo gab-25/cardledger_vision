@@ -16,9 +16,9 @@ index = build_index("mtg", catalog_bytes, catalog_sha256, httpx_client, cache_di
 
 The published indexes are built by `cardledger-db generate` in
 [cardledger_database](https://github.com/gab-25/cardledger_database), right after each catalog, and uploaded with it by
-`cardledger-db upload`. That repository follows this one's `main`, locked to one commit in its `uv.lock`: after
-changing the hash, the index format or the thresholds here, run `uv lock --upgrade-package cardledger-vision` there
-and rebuild the indexes with `cardledger-db index`.
+`cardledger-db upload`. That repository pins a release tag of this one (`v0.1.0` now) in its `pyproject.toml`: after
+changing the hash, the index format or the thresholds here, make a new release, move the `tag` there, run
+`uv lock --upgrade-package cardledger-vision` and rebuild the indexes with `cardledger-db index`.
 
 ## Measuring an index
 
