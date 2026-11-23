@@ -21,7 +21,7 @@ class Result:
 
 
 def _name_key(name: str) -> str:
-    return name.split(" // ", 1)[0].casefold()
+    return name.strip().split(" // ", 1)[0].strip().casefold()
 
 
 def _norm_number(number: str) -> str:
@@ -79,20 +79,31 @@ def recognize_hash(h: bytes, index: Index, lock: str | None = None) -> Result:
     other = d[others[0]] if others else np.inf
     identity_sure = other - d[best] >= t.name_gap
 
-    # Rule 3: printings of that name, narrowed by the lock if it matches any.
+    # Rule 3: printings of that name, narrowed by the lock if it matches any (case-insensitive).
     same_name = [i for i in order if keys.names[i] == name]
     printings = same_name
+    outside: list[int] = []
     locked = False
     if lock is not None:
-        in_lock = [i for i in same_name if index.sets[i] == lock]
+        key = lock.strip().casefold()
+        in_lock = [i for i in same_name if index.sets[i].strip().casefold() == key]
         if in_lock:
             printings, locked = in_lock, True
+            outside = [i for i in same_name if i not in set(in_lock)]
 
-    # Rule 4: one printing clearly nearer than the next.
+    # Rule 4: one printing clearly nearer than every other, all of which have an image: a printing without an
+    # image could be the card, so it blocks certainty (without a lock: any printing of the name, in any set).
     pick = None
     first = printings[0]
-    if np.isfinite(d[first]) and (len(printings) == 1 or d[printings[1]] - d[first] >= t.printing_gap):
+    rest = printings[1:]
+    if (np.isfinite(d[first]) and all(index.has_hash[i] for i in rest)
+            and (not rest or d[rest[0]] - d[first] >= t.printing_gap)):
         pick = first
+
+    # Lock guard: a printing outside the lock clearly nearer than the pick means the lock is likely wrong.
+    if pick is not None and locked and outside and d[pick] - d[outside[0]] >= t.printing_gap:
+        pick = None
+    printings = printings + outside  # candidates: in-lock printings first, then the others of the name
 
     # Rule 5: a twin (same number in another set, or the same image) blocks certainty.
     if pick is not None and not locked:
