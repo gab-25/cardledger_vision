@@ -1,21 +1,26 @@
 """Synthetic benchmark: photos made from the catalog images, recognized against an index."""
 
+import logging
 import random
 import statistics
 import time
-from collections import Counter, defaultdict
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from .catalog import CatalogProduct
+from .images import decode
 from .index import Index
-from .match import recognize
+from .match import drop_row, recognize
 
 CANVAS_W, CANVAS_H = 1500, 2000
 OUTCOMES = ("ok", "wrong_certain", "in_candidates", "not_found", "no_card")
-MODES = ("no_lock", "lock")
+MODES = ("no_lock", "lock", "unindexed")
+
+logger = logging.getLogger(__name__)
 
 
 def _gradient(rng: random.Random, np_rng: np.random.Generator, lo: float, hi: float, amp: float) -> np.ndarray:
@@ -82,16 +87,15 @@ def synth_photo(card: np.ndarray, rng: random.Random) -> bytes:
     return jpeg.tobytes()
 
 
-def _url(product: CatalogProduct, images: dict) -> str | None:
-    for url in (product.image_large_url, product.image_url):
-        if url and images.get(url):
-            return url
-    return None
+def _urls(product: CatalogProduct) -> list[str]:
+    """The product's image URLs, the one the bench prefers first."""
+    return [u for u in (product.image_large_url, product.image_url) if u]
 
 
-def sample(products: list[CatalogProduct], images: dict, size: int, seed: int) -> list[CatalogProduct]:
-    """Half at random, a quarter from names with 6+ printings, a quarter from names with 2-5; only products with an image."""
-    pool = sorted((p for p in products if _url(p, images)), key=lambda p: p.id_product)
+def sample(products: list[CatalogProduct], size: int, seed: int) -> list[CatalogProduct]:
+    """Half at random, a quarter from names with 6+ printings, a quarter from names with 2-5; only products with an
+    image URL."""
+    pool = sorted((p for p in products if _urls(p)), key=lambda p: p.id_product)
     size = min(size, len(pool))
     rng = random.Random(seed)
     printings = Counter(p.name.casefold() for p in pool)
@@ -111,6 +115,38 @@ def sample(products: list[CatalogProduct], images: dict, size: int, seed: int) -
     return list(chosen.values())
 
 
+def collect(products: list[CatalogProduct], size: int, seed: int,
+            fetch: Callable[[list[str]], dict[str, bytes | None]]) -> tuple[list[tuple[CatalogProduct, bytes]], int]:
+    """The sampled products with their image bytes, and how many sampled products had to be skipped.
+
+    Only the sampled images are fetched (the large one, else the normal one) with `fetch`, which answers None for
+    an image it can't download or decode; such a product is replaced by another drawn at random from the products not tried yet.
+    """
+    pool = sorted((p for p in products if _urls(p)), key=lambda p: p.id_product)
+    rng = random.Random(seed + 1)
+    todo = sample(pool, size, seed)
+    tried = {p.id_product for p in todo}
+    got: list[tuple[CatalogProduct, bytes]] = []
+    skipped = 0
+    while todo:
+        first = fetch([_urls(p)[0] for p in todo])
+        second = fetch([_urls(p)[1] for p in todo if len(_urls(p)) > 1 and first.get(_urls(p)[0]) is None])
+        failed = 0
+        for p in todo:
+            data = next((d for u in _urls(p) if (d := first.get(u) or second.get(u))), None)
+            if data is not None:  # `fetch` gives only bytes that decode
+                got.append((p, data))
+            else:
+                failed += 1
+        skipped += failed
+        free = [p for p in pool if p.id_product not in tried]
+        todo = rng.sample(free, min(failed, len(free)))
+        tried.update(p.id_product for p in todo)
+    if skipped:
+        logger.info("bench: skipped %d sampled products whose image could not be fetched or decoded", skipped)
+    return got, skipped
+
+
 def _percent(part: int, total: int) -> float:
     return 100 * part / total if total else 0.0
 
@@ -118,11 +154,13 @@ def _percent(part: int, total: int) -> float:
 @dataclass
 class Report:
     total: int = 0
+    skipped: int = 0
     counts: dict[str, dict[str, int]] = field(default_factory=lambda: {m: dict.fromkeys(OUTCOMES, 0) for m in MODES})
     times_ms: dict[str, list[float]] = field(default_factory=lambda: {m: [] for m in MODES})
 
     def table(self) -> str:
-        lines = [f"photos: {self.total}", f"{'outcome':<15}" + "".join(f"{m:>18}" for m in MODES)]
+        lines = [f"photos: {self.total}  skipped images: {self.skipped}",
+                 f"{'outcome':<15}" + "".join(f"{m:>18}" for m in MODES)]
         for outcome in OUTCOMES:
             row = f"{outcome:<15}"
             for mode in MODES:
@@ -134,29 +172,41 @@ class Report:
                            if len(t) > 1 else t[0])):
             lines.append(f"{label:<15}" + "".join(
                 f"{fn(self.times_ms[m]) if self.times_ms[m] else 0:>18.1f}" for m in MODES))
+        lines.append("unindexed: the card's own entry removed from the index, so any ok is a wrong_certain")
         return "\n".join(lines)
 
 
-def run(index: Index, products: list[CatalogProduct], images: dict, size: int, seed: int) -> Report:
-    report = Report()
+def _outcome(result, product: CatalogProduct) -> str:
+    if result.outcome == "ok":
+        return "ok" if result.product_id == product.id_product else "wrong_certain"
+    if result.outcome == "no_card":
+        return "no_card"
+    return "in_candidates" if product.id_product in result.candidates else "not_found"
+
+
+def _without(index: Index, product_id: int) -> Index:
+    for row in reversed(np.flatnonzero(index.ids == product_id)):
+        index = drop_row(index, int(row))
+    return index
+
+
+def run(index: Index, samples: list[tuple[CatalogProduct, bytes]], seed: int, skipped: int = 0) -> Report:
+    """Recognizes a synthetic photo of each sample without lock, with the lock on its set, and with its own entry
+    removed from the index (no lock)."""
+    report = Report(skipped=skipped)
     rng = random.Random(seed)
-    for product in sample(products, images, size, seed):
-        card = cv2.imdecode(np.frombuffer(images[_url(product, images)], np.uint8), cv2.IMREAD_COLOR)
+    for product, data in samples:
+        card = decode(data)
         if card is None:
+            report.skipped += 1
             continue
         photo = synth_photo(card, rng)
         report.total += 1
-        for mode, lock in (("no_lock", None), ("lock", product.expansion_code or None)):
+        for mode in MODES:
+            lock = product.expansion_code or None if mode == "lock" else None
+            target = _without(index, product.id_product) if mode == "unindexed" else index
             start = time.perf_counter()
-            result = recognize(photo, index, lock)
+            result = recognize(photo, target, lock)
             report.times_ms[mode].append((time.perf_counter() - start) * 1000)
-            if result.outcome == "ok":
-                outcome = "ok" if result.product_id == product.id_product else "wrong_certain"
-            elif result.outcome == "no_card":
-                outcome = "no_card"
-            elif product.id_product in result.candidates:
-                outcome = "in_candidates"
-            else:
-                outcome = "not_found"
-            report.counts[mode][outcome] += 1
+            report.counts[mode][_outcome(result, product)] += 1
     return report

@@ -200,3 +200,19 @@ def recognize(photo: bytes, index: Index, lock: str | None = None) -> Result:
         if flipped.min() < d.min():
             d = flipped
     return _decide(d, index, lock)
+
+
+def drop_row(index: Index, row: int) -> Index:
+    """`index` without its entry at `row` (the bench's card missing from the index), sharing the cached keys."""
+    keys = _keys(index)
+    out = Index()
+    out.header = index.header
+    out.ids = np.delete(index.ids, row)
+    out.hashes = np.delete(index.hashes, row, axis=0)
+    out.has_hash = np.delete(index.has_hash, row)
+    out.names = index.names[:row] + index.names[row + 1:]
+    out.sets = index.sets[:row] + index.sets[row + 1:]
+    out.numbers = index.numbers[:row] + index.numbers[row + 1:]
+    out._match_keys = _Keys(np.delete(keys.names, row), np.delete(keys.numbers, row), np.delete(keys.sets, row),
+                            keys.set_ids, keys.hashed - int(index.has_hash[row]))
+    return out

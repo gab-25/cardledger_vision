@@ -120,10 +120,10 @@ def _bench(args) -> None:
     except (RuntimeError, OSError, ValueError) as exc:
         raise CliError(str(exc)) from exc
     products = catalog.load(data)
-    urls = [p.image_large_url or p.image_url for p in products if p.image_large_url or p.image_url]
     with make_client() as client:
-        fetched = images.fetch(urls, args.cache, client)
-    print(bench.run(index, products, fetched, args.size, args.seed).table())
+        samples, skipped = bench.collect(products, args.size, args.seed,
+                                         lambda urls: images.fetch(urls, args.cache, client, args.host_interval))
+    print(bench.run(index, samples, args.seed, skipped).table())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--cache", type=Path, default=Path(".cache"), help="cache folder (default: .cache)")
     command.add_argument("--size", type=int, default=200, help="photos to make (default: 200)")
     command.add_argument("--seed", type=int, default=42, help="sample and photo seed (default: 42)")
+    command.add_argument("--host-interval", type=float, default=images.MIN_INTERVAL,
+                         help=f"seconds between two requests to an image host (default: {images.MIN_INTERVAL})")
     args = parser.parse_args(argv)
 
     handler = logging.StreamHandler(sys.stdout)
