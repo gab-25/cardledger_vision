@@ -144,3 +144,28 @@ def test_double_faced_name_and_number_normalization():
 def test_ok_with_several_printings_puts_pick_first():
     e = [Entry(1, "Bolt", "a", "1", near(H[0], 20)), Entry(2, "Bolt", "b", "2", H[0])]
     assert recognize_hash(H[0], idx(*e)) == Result("ok", 2, [2, 1])
+
+
+def big_index(n=100_000, seed=0):
+    rng = np.random.default_rng(seed)
+    hashes = rng.integers(0, 256, (n, 32), dtype=np.uint8)
+    entries = [Entry(i + 1, f"Card {i % 30_000}", f"s{i % 400}", str(i % 300),
+                     hashes[i].tobytes() if i % 10 else None) for i in range(n)]
+    return Index.load(encode(Header("mtg", "t", "x"), entries)), hashes
+
+
+def test_recognize_hash_is_fast_on_100k_entries():
+    import statistics
+    import time
+
+    index, hashes = big_index()
+    recognize_hash(hashes[1].tobytes(), index)  # builds the cached keys
+    times = []
+    for k in range(1, 31):
+        h = near(hashes[k * 7 + 1].tobytes(), 5)
+        start = time.perf_counter()
+        recognize_hash(h, index, lock="s8" if k % 2 else None)
+        times.append((time.perf_counter() - start) * 1000)
+    median = statistics.median(times)
+    print(f"recognize_hash median on 100k entries: {median:.1f} ms")
+    assert median < 40
