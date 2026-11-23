@@ -4,6 +4,7 @@ a disk cache of the images that decode."""
 import hashlib
 import logging
 import os
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -26,6 +27,7 @@ BACKOFF = (0.5, 1, 2)  # seconds to wait after a failed attempt, when another on
 MAX_RETRY_AFTER = 60  # a longer Retry-After is capped
 BATCH = 1000  # URLs submitted to the workers at once
 BACKGROUND = 128  # grey under the transparent pixels of a PNG
+HASHES = "hashes"  # cache subfolder of the image hashes; rename it if the hash recipe changes
 
 logger = logging.getLogger(__name__)
 
@@ -172,12 +174,46 @@ def _safe(url: str, work, cache_dir: Path | None, client: httpx.Client, interval
         return None
 
 
+def _stamp(path: Path) -> bytes | None:
+    """Size and modification time of the cached image, which a cached hash must match."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return struct.pack("<QQ", st.st_size, st.st_mtime_ns)
+
+
+def _cached_hash(url: str, cache_dir: Path | None, client: httpx.Client, interval: float) -> bytes | None:
+    """The hash of the URL's image. With a cache, the hash is kept next to the image (cache/hashes/<sha1>, with the
+    image file's size and mtime), so a rebuild doesn't decode the image again; an image file that changed or went
+    is fetched and hashed again."""
+    if cache_dir is None:
+        return _safe(url, lambda data, image: card_hash(image), None, client, interval)
+    name = hashlib.sha1(url.encode()).hexdigest()
+    image_path, hash_path = cache_dir / "images" / name, cache_dir / HASHES / name
+    try:
+        saved = hash_path.read_bytes()
+    except OSError:
+        saved = b""
+    stamp = _stamp(image_path)
+    if stamp is not None and len(saved) == len(stamp) + 32 and saved.startswith(stamp):
+        return saved[len(stamp):]
+    h = _safe(url, lambda data, image: card_hash(image), cache_dir, client, interval)
+    stamp = _stamp(image_path)
+    if h is not None and stamp is not None:
+        try:
+            hash_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = hash_path.with_name(f"{name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_bytes(stamp + h)
+            os.replace(tmp, hash_path)
+        except OSError as exc:  # the hash is still good, only not kept
+            logger.debug("%s: %s", hash_path, exc)
+    return h
+
+
 def _hash_batch(urls: list[str], pool: ThreadPoolExecutor, cache_dir: Path | None, client: httpx.Client,
                 interval: float) -> list[bytes | None]:
-    def work(data: bytes, image: np.ndarray) -> bytes:
-        return card_hash(image)
-
-    return list(pool.map(lambda url: _safe(url, work, cache_dir, client, interval), urls))
+    return list(pool.map(lambda url: _cached_hash(url, cache_dir, client, interval), urls))
 
 
 def fetch_hashes(urls: list[str], cache_dir: Path | None, client: httpx.Client,

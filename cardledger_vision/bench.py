@@ -1,11 +1,13 @@
 """Synthetic benchmark: photos made from the catalog images, recognized against an index."""
 
 import logging
+import os
 import random
 import statistics
 import time
 from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import cv2
@@ -23,36 +25,84 @@ MODES = ("no_lock", "lock", "unindexed")
 logger = logging.getLogger(__name__)
 
 
-def _gradient(rng: random.Random, np_rng: np.random.Generator, lo: float, hi: float, amp: float) -> np.ndarray:
-    yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W].astype(np.float32)
-    out = np.zeros((CANVAS_H, CANVAS_W, 3), np.float32)
-    for c in range(3):
+@dataclass(frozen=True)
+class _Shot:
+    """Every random draw of one synthetic photo, in the order `random.Random` gives them; the pixels follow from
+    these alone, so the photos can be rendered in parallel once the draws are made in turn."""
+    np_seed: int
+    background: tuple  # (gx, gy, base) per channel
+    height: float  # card height, fraction of the canvas height
+    shift: tuple[float, float]
+    angle: float  # degrees
+    corners: tuple  # (jx, jy) per corner, fraction of the card size
+    gain: float
+    offset: float
+    light: tuple  # (gx, gy, base) per channel
+    glare: tuple | None  # (axis x, axis y, centre dx, centre dy, angle, strength)
+    blur: float
+    motion: tuple[int, float] | None  # (kernel size, angle)
+    noise: float
+    quality: int
+
+
+def _gradient_draws(rng: random.Random, lo: float, hi: float) -> tuple:
+    out = []
+    for _ in range(3):
         gx, gy = rng.uniform(-1, 1), rng.uniform(-1, 1)
-        out[..., c] = rng.uniform(lo, hi) + gx * xx / CANVAS_W * amp + gy * yy / CANVAS_H * amp
+        out.append((gx, gy, rng.uniform(lo, hi)))
+    return tuple(out)
+
+
+def _draw(rng: random.Random) -> _Shot:
+    np_seed = rng.randrange(2**32)
+    background = _gradient_draws(rng, 70, 170)
+    height = rng.uniform(0.62, 0.85)
+    shift = (rng.uniform(-80, 80), rng.uniform(-80, 80))
+    angle = rng.uniform(-10, 10)
+    corners = tuple((rng.uniform(-0.07, 0.07), rng.uniform(-0.07, 0.07)) for _ in range(4))
+    gain, offset = rng.uniform(0.75, 1.15), rng.uniform(-20, 20)
+    light = _gradient_draws(rng, 0, 0)  # zero base: only the slopes act
+    glare = None
+    if rng.random() < 0.35:
+        glare = (rng.uniform(0.1, 0.3), rng.uniform(0.05, 0.15), rng.uniform(-200, 200), rng.uniform(-300, 300),
+                 rng.uniform(0, 180), rng.uniform(60, 140))
+    blur = rng.uniform(0.3, 1.8)
+    motion = (rng.randrange(5, 16), rng.uniform(0, 180)) if rng.random() < 0.20 else None
+    noise = rng.uniform(2, 7)
+    quality = rng.randrange(70, 91)
+    return _Shot(np_seed, background, height, shift, angle, corners, gain, offset, light, glare, blur, motion, noise,
+                 quality)
+
+
+def _gradient(draws: tuple, amp: float) -> np.ndarray:
+    # One row and one column, broadcast: the same values as full coordinate grids, without building them.
+    xx = np.arange(CANVAS_W, dtype=np.float32)[None, :]
+    yy = np.arange(CANVAS_H, dtype=np.float32)[:, None]
+    out = np.empty((CANVAS_H, CANVAS_W, 3), np.float32)
+    for c, (gx, gy, base) in enumerate(draws):
+        out[..., c] = (base + gx * xx / CANVAS_W * amp) + gy * yy / CANVAS_H * amp
     return out
 
 
-def synth_photo(card: np.ndarray, rng: random.Random) -> bytes:
-    """A JPEG of the card as a phone would shoot it; deterministic given `rng`."""
-    np_rng = np.random.default_rng(rng.randrange(2**32))
+def _render(card: np.ndarray, shot: _Shot) -> bytes:
+    np_rng = np.random.default_rng(shot.np_seed)
 
     # Background: gradient plus blurred noise.
-    bg = _gradient(rng, np_rng, 70, 170, 60)
+    bg = _gradient(shot.background, 60)
     noise = np_rng.normal(0, 25, (CANVAS_H // 20, CANVAS_W // 20, 3)).astype(np.float32)
     noise = cv2.resize(noise, (CANVAS_W, CANVAS_H), interpolation=cv2.INTER_CUBIC)
     canvas = np.clip(cv2.GaussianBlur(bg + noise, (0, 0), 15), 0, 255).astype(np.uint8)
 
     # Card: 62-85% of the canvas height, shifted up to 80 px, corners moved up to 7%, rotated up to 10 degrees.
-    ch = rng.uniform(0.62, 0.85) * CANVAS_H
+    ch = shot.height * CANVAS_H
     cw = ch * card.shape[1] / card.shape[0]
-    cx = CANVAS_W / 2 + rng.uniform(-80, 80)
-    cy = CANVAS_H / 2 + rng.uniform(-80, 80)
-    angle = np.radians(rng.uniform(-10, 10))
+    cx = CANVAS_W / 2 + shot.shift[0]
+    cy = CANVAS_H / 2 + shot.shift[1]
+    angle = np.radians(shot.angle)
     rot = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
     dst = []
-    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
-        jx, jy = rng.uniform(-0.07, 0.07) * cw, rng.uniform(-0.07, 0.07) * ch
-        dst.append(rot @ np.array([sx * cw / 2 + jx, sy * ch / 2 + jy]) + (cx, cy))
+    for (sx, sy), (jx, jy) in zip(((-1, -1), (1, -1), (1, 1), (-1, 1)), shot.corners):
+        dst.append(rot @ np.array([sx * cw / 2 + jx * cw, sy * ch / 2 + jy * ch]) + (cx, cy))
     h, w = card.shape[:2]
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     m = cv2.getPerspectiveTransform(src, np.float32(dst))
@@ -62,29 +112,34 @@ def synth_photo(card: np.ndarray, rng: random.Random) -> bytes:
     img = warped.astype(np.float32) * a + canvas.astype(np.float32) * (1 - a)
 
     # Light: brightness, a gradient, sometimes an elliptical glare.
-    img = img * rng.uniform(0.75, 1.15) + rng.uniform(-20, 20)
-    img += _gradient(rng, np_rng, 0, 0, 40)  # zero base: only the slopes act
-    if rng.random() < 0.35:
+    img = img * shot.gain + shot.offset
+    img += _gradient(shot.light, 40)
+    if shot.glare is not None:
+        ax, ay, dx, dy, glare_angle, strength = shot.glare
         glare = np.zeros((CANVAS_H, CANVAS_W), np.float32)
-        axes = (int(rng.uniform(0.1, 0.3) * CANVAS_W), int(rng.uniform(0.05, 0.15) * CANVAS_H))
-        cv2.ellipse(glare, (int(cx + rng.uniform(-200, 200)), int(cy + rng.uniform(-300, 300))), axes,
-                    rng.uniform(0, 180), 0, 360, 1.0, -1)
-        glare = cv2.GaussianBlur(glare, (0, 0), 40) * rng.uniform(60, 140)
+        cv2.ellipse(glare, (int(cx + dx), int(cy + dy)), (int(ax * CANVAS_W), int(ay * CANVAS_H)), glare_angle,
+                    0, 360, 1.0, -1)
+        glare = cv2.GaussianBlur(glare, (0, 0), 40) * strength
         img += glare[..., None]
     img = np.clip(img, 0, 255).astype(np.uint8)
 
     # Optics: blur, sometimes motion blur, sensor noise, JPEG.
-    img = cv2.GaussianBlur(img, (0, 0), rng.uniform(0.3, 1.8))
-    if rng.random() < 0.20:
-        k = rng.randrange(5, 16)
+    img = cv2.GaussianBlur(img, (0, 0), shot.blur)
+    if shot.motion is not None:
+        k, motion_angle = shot.motion
         kernel = np.zeros((k, k), np.float32)
         kernel[k // 2, :] = 1 / k
-        rm = cv2.getRotationMatrix2D((k / 2 - 0.5, k / 2 - 0.5), rng.uniform(0, 180), 1)
+        rm = cv2.getRotationMatrix2D((k / 2 - 0.5, k / 2 - 0.5), motion_angle, 1)
         kernel = cv2.warpAffine(kernel, rm, (k, k))
         img = cv2.filter2D(img, -1, kernel / max(kernel.sum(), 1e-6))
-    img = np.clip(img.astype(np.float32) + np_rng.normal(0, rng.uniform(2, 7), img.shape), 0, 255).astype(np.uint8)
-    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, rng.randrange(70, 91)])
+    img = np.clip(img.astype(np.float32) + np_rng.normal(0, shot.noise, img.shape), 0, 255).astype(np.uint8)
+    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, shot.quality])
     return jpeg.tobytes()
+
+
+def synth_photo(card: np.ndarray, rng: random.Random) -> bytes:
+    """A JPEG of the card as a phone would shoot it; deterministic given `rng`."""
+    return _render(card, _draw(rng))
 
 
 def _urls(product: CatalogProduct) -> list[str]:
@@ -190,17 +245,31 @@ def _without(index: Index, product_id: int) -> Index:
     return index
 
 
+def _photos(samples: list[tuple[CatalogProduct, bytes]], seed: int) -> list[tuple[CatalogProduct, bytes] | None]:
+    """The synthetic photo of each sample, None where its image doesn't decode. The random draws are made in
+    sample order, so the photos are the same as one by one; the pixels are rendered on every core."""
+    with ThreadPoolExecutor(os.cpu_count()) as pool:
+        decodes = list(pool.map(lambda s: decode(s[1]) is not None, samples))
+        rng = random.Random(seed)
+        shots = [_draw(rng) if ok else None for ok in decodes]
+
+        def render(item):
+            (product, data), shot = item
+            return None if shot is None else (product, _render(decode(data), shot))
+
+        return list(pool.map(render, zip(samples, shots)))
+
+
 def run(index: Index, samples: list[tuple[CatalogProduct, bytes]], seed: int, skipped: int = 0) -> Report:
     """Recognizes a synthetic photo of each sample without lock, with the lock on its set, and with its own entry
-    removed from the index (no lock)."""
+    removed from the index (no lock). The photos are all made first, so nothing else runs while `recognize` is
+    timed."""
     report = Report(skipped=skipped)
-    rng = random.Random(seed)
-    for product, data in samples:
-        card = decode(data)
-        if card is None:
+    for item in _photos(samples, seed):
+        if item is None:
             report.skipped += 1
             continue
-        photo = synth_photo(card, rng)
+        product, photo = item
         report.total += 1
         for mode in MODES:
             lock = product.expansion_code or None if mode == "lock" else None
