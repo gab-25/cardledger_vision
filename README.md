@@ -8,8 +8,9 @@ Commands: `uv sync`, `uv run pytest -q`.
 
 The indexes in the bucket are built by `cardledger-db generate` in
 [cardledger_database](https://github.com/gab-25/cardledger_database), right after each catalog, with this library's
-`build_index`; `cardledger-db upload` uploads the catalog and its index together. Its `uv.lock` pins a tag of this
-repository: after changing the hash, the index format or the thresholds, tag a new version and update the pin there.
+`build_index`; `cardledger-db upload` uploads the catalog and its index together. It follows this repository's `main`,
+locked to one commit in its `uv.lock`: after changing the hash, the index format or the thresholds here, run
+`uv lock --upgrade-package cardledger-vision` there and rebuild the indexes.
 The commands below stay for development: build an index, measure it with `bench`, try a change.
 
 ```python
