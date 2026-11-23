@@ -14,7 +14,8 @@ The commands read the bucket settings from the environment or from a `.env` file
 ```bash
 uv run cardledger-vision build-index                      # every game (same as --game all)
 uv run cardledger-vision build-index --game mtg           # reads catalog/v1/mtg.json from the bucket, writes out/vision/v1/mtg.bin
-uv run cardledger-vision upload --game mtg
+uv run cardledger-vision upload                           # every game's index in out/ (or --game mtg)
+uv run cardledger-vision bench                            # every game's index in out/ (or --game mtg)
 uv run cardledger-vision bench --game mtg --index out/vision/v1/mtg.bin   # --catalog PATH, --size 200, --seed 42
 ```
 
@@ -26,6 +27,7 @@ median and p90 time of `recognize`.
 Confirm-only rule: if `wrong_certain` is above 2% for a game, rebuild that game's index with
 `build-index --game <slug> --confirm-only`, so it never answers `ok` without confirmation.
 
-Without `--game`, `build-index` builds every game in turn: a game that fails (e.g. its catalog is missing from the
-bucket) is logged and skipped, and the command exits with 1 naming it. `--catalog` is one game's file, so it needs
-`--game`.
+Every command works on all the games when `--game` is left out (same as `--game all`). `build-index` and `bench`
+go through the games in turn: a game that fails (e.g. its catalog is missing from the bucket) is logged and skipped,
+and the command exits with 1 naming it. `upload` checks every index first and uploads nothing if one is missing or
+invalid. `--catalog` and `--index` are one game's file, so they need `--game`.

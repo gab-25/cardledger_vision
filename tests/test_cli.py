@@ -424,3 +424,49 @@ def test_ctrl_c_exits_without_traceback(tmp_path, monkeypatch, capsys):
     assert cli.main(["build-index", "--game", "mtg", "--catalog", str(path), "--out", str(tmp_path / "out")]) == 130
     assert "interrupted" in capsys.readouterr().out
     assert not (tmp_path / "out/vision/v1/mtg.bin").exists()
+
+
+@pytest.mark.parametrize("argv", [[], ["--game", "all"]])
+def test_upload_without_game_uploads_every_game(tmp_path, monkeypatch, argv):
+    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
+    monkeypatch.chdir(tmp_path)
+    for slug in cli.GAMES:
+        write_index(tmp_path, slug)
+    s3 = FakeS3()
+    monkeypatch.setattr(cli, "make_s3", lambda: s3)
+    assert cli.main(["upload", *argv, "--out", str(tmp_path)]) == 0
+    assert [put["Key"] for put in s3.puts] == [cli.index_key(slug) for slug in cli.GAMES]
+
+
+def test_upload_without_game_uploads_nothing_when_one_is_missing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CARDLEDGER_S3_BUCKET", "bkt")
+    monkeypatch.chdir(tmp_path)
+    for slug in cli.GAMES[1:]:
+        write_index(tmp_path, slug)
+    s3 = FakeS3()
+    monkeypatch.setattr(cli, "make_s3", lambda: s3)
+    assert cli.main(["upload", "--out", str(tmp_path)]) == 1
+    assert cli.GAMES[0] in capsys.readouterr().out and s3.puts == []
+
+
+def test_bench_without_game_benches_every_game(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "make_s3", lambda: Bucket(missing={"lorcana"}))
+    benched = []
+
+    def bench_game(slug, args, s3):
+        if slug == "lorcana":
+            raise cli.CliError("no catalog")
+        benched.append((slug, args.index or args.out / cli.index_key(slug)))
+
+    monkeypatch.setattr(cli, "_bench_game", bench_game)
+    assert cli.main(["bench", "--out", str(tmp_path / "out")]) == 1
+    assert benched == [(slug, tmp_path / "out" / cli.index_key(slug)) for slug in cli.GAMES if slug != "lorcana"]
+    assert "bench failed for: lorcana" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("option", ["--index", "--catalog"])
+def test_bench_one_games_file_without_game_is_refused(tmp_path, monkeypatch, capsys, option):
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["bench", option, str(tmp_path / "x")]) == 1
+    assert "--game" in capsys.readouterr().out
