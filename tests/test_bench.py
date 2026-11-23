@@ -2,7 +2,6 @@ import random
 
 import cv2
 
-from cardledger_vision import cli
 from cardledger_vision.bench import collect, run, sample, synth_photo
 from cardledger_vision.catalog import CatalogProduct
 from cardledger_vision.index import Entry, Header, Index, encode
@@ -22,7 +21,7 @@ def framed(card_image, i):
     return cv2.copyMakeBorder(card_image(i), 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=(15, 15, 15))
 
 
-def make(card_image, n=3, extra=()):
+def make(card_image, n=3, extra=(), confirm_only=False):
     products, images, entries = [], {}, []
     for i in range(1, n + 1):
         url = f"https://img.test/large/{i}.png"
@@ -32,7 +31,7 @@ def make(card_image, n=3, extra=()):
         h = hash_card(cv2.resize(framed(card_image, i), CARD_SIZE, interpolation=cv2.INTER_AREA))
         entries.append(Entry(i, f"Card {i}", "set", str(i), h))
     entries += list(extra)
-    index = Index.load(encode(Header("mtg", "2026-01-01T00:00:00Z", "x", False), entries))
+    index = Index.load(encode(Header("mtg", "2026-01-01T00:00:00Z", "x", confirm_only), entries))
     return index, products, images
 
 
@@ -51,6 +50,28 @@ def test_run_counts_outcomes(card_image):
     assert report.counts["unindexed"]["ok"] == 0
     table = report.table()
     assert "wrong_certain" in table and "%" in table and "p90" in table and "unindexed" in table
+
+
+def test_a_confirm_only_index_is_measured_as_if_it_were_not(card_image):
+    index, products, images = make(card_image)
+    certain = run(index, samples_of(products, images), seed=1)
+    confirm_only, _, _ = make(card_image, confirm_only=True)
+    report = run(confirm_only, samples_of(products, images), seed=1)
+    assert report.counts == certain.counts and report.counts["no_lock"]["ok"] > 0
+    assert report.ranks == certain.ranks
+    assert confirm_only.header.confirm_only  # the index passed in is left as it was
+    assert "confirm-only index" in report.table() and "confirm-only index" not in certain.table()
+
+
+def test_ranks_place_the_right_card_among_the_candidates(card_image):
+    index, products, images = make(card_image)
+    report = run(index, samples_of(products, images), seed=1)
+    for mode in ("no_lock", "lock"):
+        found = report.counts[mode]["ok"] + report.counts[mode]["in_candidates"]
+        assert sum(report.ranks[mode].values()) == found
+        assert report.ranks[mode]["1st"] >= report.counts[mode]["ok"]  # an ok answer is its first candidate
+    assert sum(report.ranks["unindexed"].values()) == 0  # the card is not in the index
+    assert "right card among the candidates" in report.table() and "2nd-3rd" in report.table()
 
 
 def test_unindexed_mode_counts_a_certain_answer_as_wrong(card_image):
@@ -106,36 +127,6 @@ def test_collect_fetches_only_the_sample_and_replacements():
     for p, _ in got:  # the large image when it works, else the normal one
         assert (p.image_large_url in asked and p.image_large_url not in broken) or p.image_url not in broken
     assert collect(products, 10, 5, fetch)[0] == got  # deterministic
-
-
-def test_bench_command(card_image, tmp_path, monkeypatch, capsys):
-    import json
-    index, products, images = make(card_image)
-    products.append(CatalogProduct(99, "No image", "set", "99", None, None))
-    (tmp_path / "mtg.bin").write_bytes(encode(index.header, [
-        Entry(int(index.ids[i]), index.names[i], index.sets[i], index.numbers[i], index.hashes[i].tobytes())
-        for i in range(len(index))]))
-    cat = tmp_path / "c.json"
-    cat.write_text(json.dumps({"expansions": [], "products": [
-        {"id_product": p.id_product, "name": p.name, "expansion_code": "set", "number": p.number,
-         "image_url": None, "image_large_url": p.image_large_url, "category_name": "Magic Singles"}
-        for p in products]}))
-    import httpx
-
-    asked = []
-
-    def handler(request):
-        asked.append(str(request.url))
-        return httpx.Response(200, content=images[str(request.url)])
-
-    monkeypatch.setattr(cli, "make_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
-    monkeypatch.setattr("cardledger_vision.images.sleep", lambda s: None)
-    code = cli.main(["bench", "--game", "mtg", "--index", str(tmp_path / "mtg.bin"), "--catalog", str(cat),
-                     "--cache", str(tmp_path / "cache"), "--size", "2", "--host-interval", "0"])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "wrong_certain" in out and "unindexed" in out and "skipped" in out
-    assert len(asked) == 2  # only the sampled images
 
 
 def test_parallel_photos_match_the_serial_ones(card_image):

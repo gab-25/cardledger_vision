@@ -1,5 +1,6 @@
 """Synthetic benchmark: photos made from the catalog images, recognized against an index."""
 
+import copy
 import logging
 import os
 import random
@@ -8,7 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -21,6 +22,7 @@ from .match import drop_row, recognize
 CANVAS_W, CANVAS_H = 1500, 2000
 OUTCOMES = ("ok", "wrong_certain", "in_candidates", "not_found", "no_card")
 MODES = ("no_lock", "lock", "unindexed")
+RANKS = ("1st", "2nd-3rd", "4th+")  # where the right card is among the candidates, when it is there
 
 logger = logging.getLogger(__name__)
 
@@ -210,24 +212,30 @@ def _percent(part: int, total: int) -> float:
 class Report:
     total: int = 0
     skipped: int = 0
+    confirm_only: bool = False  # the index is confirm-only: it was measured as if it were not
     counts: dict[str, dict[str, int]] = field(default_factory=lambda: {m: dict.fromkeys(OUTCOMES, 0) for m in MODES})
+    ranks: dict[str, dict[str, int]] = field(default_factory=lambda: {m: dict.fromkeys(RANKS, 0) for m in MODES})
     times_ms: dict[str, list[float]] = field(default_factory=lambda: {m: [] for m in MODES})
+
+    def _row(self, label: str, table: dict[str, dict[str, int]], key: str) -> str:
+        return f"{label:<15}" + "".join(
+            f"{table[mode][key]:>9} {_percent(table[mode][key], self.total):>6.1f}% " for mode in MODES)
 
     def table(self) -> str:
         lines = [f"photos: {self.total}  skipped images: {self.skipped}",
                  f"{'outcome':<15}" + "".join(f"{m:>18}" for m in MODES)]
-        for outcome in OUTCOMES:
-            row = f"{outcome:<15}"
-            for mode in MODES:
-                n = self.counts[mode][outcome]
-                row += f"{n:>9} {_percent(n, self.total):>6.1f}% "
-            lines.append(row)
+        lines += [self._row(outcome, self.counts, outcome) for outcome in OUTCOMES]
+        lines.append("right card among the candidates, at:")
+        lines += [self._row(f"  {rank}", self.ranks, rank) for rank in RANKS]
         for label, fn in (("median ms", statistics.median),
                           ("p90 ms", lambda t: statistics.quantiles(t, n=10, method="inclusive")[-1]
                            if len(t) > 1 else t[0])):
             lines.append(f"{label:<15}" + "".join(
                 f"{fn(self.times_ms[m]) if self.times_ms[m] else 0:>18.1f}" for m in MODES))
         lines.append("unindexed: the card's own entry removed from the index, so any ok is a wrong_certain")
+        if self.confirm_only:
+            lines.append("confirm-only index, measured as if it were not: its app answers every ok and wrong_certain "
+                         "as a choice among the candidates")
         return "\n".join(lines)
 
 
@@ -237,6 +245,20 @@ def _outcome(result, product: CatalogProduct) -> str:
     if result.outcome == "no_card":
         return "no_card"
     return "in_candidates" if product.id_product in result.candidates else "not_found"
+
+
+def _rank(result, product: CatalogProduct) -> str | None:
+    if product.id_product not in result.candidates:
+        return None
+    position = result.candidates.index(product.id_product)
+    return RANKS[0] if position == 0 else RANKS[1] if position < 3 else RANKS[2]
+
+
+def _certain(index: Index) -> Index:
+    """`index` with confirm-only off, so `recognize` says when it would be certain (the copy shares the arrays)."""
+    out = copy.copy(index)
+    out.header = replace(index.header, confirm_only=False)
+    return out
 
 
 def _without(index: Index, product_id: int) -> Index:
@@ -263,8 +285,11 @@ def _photos(samples: list[tuple[CatalogProduct, bytes]], seed: int) -> list[tupl
 def run(index: Index, samples: list[tuple[CatalogProduct, bytes]], seed: int, skipped: int = 0) -> Report:
     """Recognizes a synthetic photo of each sample without lock, with the lock on its set, and with its own entry
     removed from the index (no lock). The photos are all made first, so nothing else runs while `recognize` is
-    timed."""
-    report = Report(skipped=skipped)
+    timed. A confirm-only index is measured as if it were not, so `ok` and `wrong_certain` still say how often a
+    certain answer would be right."""
+    report = Report(skipped=skipped, confirm_only=index.header.confirm_only)
+    if index.header.confirm_only:
+        index = _certain(index)
     for item in _photos(samples, seed):
         if item is None:
             report.skipped += 1
@@ -278,4 +303,7 @@ def run(index: Index, samples: list[tuple[CatalogProduct, bytes]], seed: int, sk
             result = recognize(photo, target, lock)
             report.times_ms[mode].append((time.perf_counter() - start) * 1000)
             report.counts[mode][_outcome(result, product)] += 1
+            rank = _rank(result, product)
+            if rank is not None:
+                report.ranks[mode][rank] += 1
     return report
