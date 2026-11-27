@@ -16,8 +16,8 @@ MAX_CANDIDATES = 5
 @dataclass(frozen=True)
 class Result:
     outcome: Literal["ok", "ambiguous", "not_found", "no_card"]
-    product_id: int | None
-    candidates: list[int]
+    product_id: str | None  # the catalog row's id
+    candidates: list[str]
 
 
 def _name_key(name: str) -> str:
@@ -80,10 +80,10 @@ def _nearest(d: np.ndarray, k: int) -> list[int]:
     return _sorted(rows, d)[:k]
 
 
-def _ids(index: Index, rows) -> list[int]:
-    out: list[int] = []
+def _ids(index: Index, rows) -> list[str]:
+    out: list[str] = []
     for i in rows:
-        pid = int(index.ids[i])
+        pid = index.ids[i]
         if pid not in out:
             out.append(pid)
         if len(out) == MAX_CANDIDATES:
@@ -178,7 +178,7 @@ def _decide(d: np.ndarray, index: Index, lock: str | None) -> Result:
         if index.header.confirm_only:
             return Result("ambiguous", None, candidates)
         # Rule 8.
-        return Result("ok", int(index.ids[pick]), candidates)
+        return Result("ok", index.ids[pick], candidates)
     return Result("ambiguous", None, _ids(index, printings))
 
 
@@ -207,7 +207,7 @@ def drop_row(index: Index, row: int) -> Index:
     keys = _keys(index)
     out = Index()
     out.header = index.header
-    out.ids = np.delete(index.ids, row)
+    out.ids = index.ids[:row] + index.ids[row + 1:]
     out.hashes = np.delete(index.hashes, row, axis=0)
     out.has_hash = np.delete(index.has_hash, row)
     out.names = index.names[:row] + index.names[row + 1:]

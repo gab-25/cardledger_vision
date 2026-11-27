@@ -9,19 +9,19 @@ Byte layout (offsets from the start of the file):
                     10 + header_len + 4 is a multiple of 8
     10+header_len   u32       n, the number of entries
     A = 14+header_len  (multiple of 8)
-                    n x u32   product_id
-    A + 4n          n x u8    has_hash (1 = the entry has a hash, 0 = no image)
-    A + 5n          (-5n mod 8) zero bytes, so that the hashes start at a multiple of 8
-    B = A + 5n + pad  (multiple of 8)
+                    n x u8    has_hash (1 = the entry has a hash, 0 = no image)
+    A + n           (-n mod 8) zero bytes, so that the hashes start at a multiple of 8
+    B = A + n + pad  (multiple of 8)
                     n x 32 bytes  hash (see phash.hash_card; all zeros when has_hash is 0)
     B + 32n         u32       strings_len
-    B + 32n + 4     strings_len bytes: JSON {"names": [...], "sets": [...], "numbers": [...]}, n strings each
+    B + 32n + 4     strings_len bytes: JSON {"ids": [...], "names": [...], "sets": [...], "numbers": [...]},
+                    n strings each; "ids" are the catalog rows' ids
     end of file (no trailing bytes)
 
-The alignment lets a JavaScript reader view the ids as a Uint32Array and the hashes as a Uint8Array or
-BigUint64Array directly on the file's ArrayBuffer. The header JSON holds "game", "built_at", "catalog_sha256",
-"confirm_only" and "thresholds" ({"identity_max", "name_gap", "printing_gap"}); readers ignore unknown keys and
-use the defaults for missing optional ones.
+The alignment lets a JavaScript reader view the hashes as a Uint8Array or BigUint64Array directly on the file's
+ArrayBuffer. The header JSON holds "game", "built_at", "catalog_sha256", "confirm_only" and "thresholds"
+({"identity_max", "name_gap", "printing_gap"}); readers ignore unknown keys and use the defaults for missing
+optional ones.
 """
 
 import json
@@ -41,7 +41,7 @@ class InvalidIndex(ValueError):
 
 @dataclass(frozen=True)
 class Entry:
-    product_id: int
+    id: str
     name: str
     set_code: str
     number: str
@@ -72,21 +72,22 @@ _PREFIX = 10  # magic, version, header_len
 
 
 def _pad(n: int) -> int:
-    """Zero bytes after has_hash, so that the hashes start 8-aligned (the ids block is)."""
-    return -(5 * n) % 8
+    """Zero bytes after has_hash, so that the hashes start 8-aligned (has_hash does)."""
+    return -n % 8
 
 
 def encode(header: Header, entries: list[Entry]) -> bytes:
     n = len(entries)
     head = _json(asdict(header))
-    head += b" " * (-(_PREFIX + len(head) + 4) % 8)  # the ids block starts 8-aligned
+    head += b" " * (-(_PREFIX + len(head) + 4) % 8)  # has_hash starts 8-aligned
     for e in entries:
         if e.hash is not None and len(e.hash) != HASH_BYTES:
-            raise ValueError(f"product {e.product_id}: hash must be {HASH_BYTES} bytes, not {len(e.hash)}")
+            raise ValueError(f"entry {e.id}: hash must be {HASH_BYTES} bytes, not {len(e.hash)}")
     has_hash = bytes(1 if e.hash is not None else 0 for e in entries)
     hashes = b"".join(e.hash if e.hash is not None else bytes(HASH_BYTES) for e in entries)
     strings = _json(
         {
+            "ids": [e.id for e in entries],
             "names": [e.name for e in entries],
             "sets": [e.set_code for e in entries],
             "numbers": [e.number for e in entries],
@@ -98,7 +99,6 @@ def encode(header: Header, entries: list[Entry]) -> bytes:
             struct.pack("<HI", FORMAT_VERSION, len(head)),
             head,
             struct.pack("<I", n),
-            struct.pack(f"<{n}I", *(e.product_id for e in entries)),
             has_hash,
             bytes(_pad(n)),
             hashes,
@@ -151,7 +151,7 @@ def _header(raw) -> Header:
 
 class Index:
     header: Header
-    ids: np.ndarray
+    ids: list[str]
     hashes: np.ndarray
     has_hash: np.ndarray
     names: list[str]
@@ -172,7 +172,6 @@ class Index:
         header = _header(_loads(r.take(r.u32()), "header"))
 
         n = r.u32()
-        ids = np.frombuffer(r.take(n * 4), dtype="<u4").astype(np.uint32)
         has_hash = np.frombuffer(r.take(n), dtype=np.uint8).astype(bool)
         r.take(_pad(n))
         hashes = np.frombuffer(r.take(n * HASH_BYTES), dtype=np.uint8).reshape(n, HASH_BYTES)
@@ -180,10 +179,10 @@ class Index:
         if r.pos != len(r.data):
             raise InvalidIndex("trailing data")
         try:
-            names, sets, numbers = strings["names"], strings["sets"], strings["numbers"]
+            ids, names, sets, numbers = strings["ids"], strings["names"], strings["sets"], strings["numbers"]
         except (TypeError, KeyError) as exc:
             raise InvalidIndex("invalid strings block") from exc
-        for arr in (names, sets, numbers):
+        for arr in (ids, names, sets, numbers):
             if not isinstance(arr, list) or len(arr) != n or not all(isinstance(s, str) for s in arr):
                 raise InvalidIndex("string arrays do not match the entry count")
 

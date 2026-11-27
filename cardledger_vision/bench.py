@@ -7,9 +7,9 @@ import random
 import statistics
 import time
 from collections import Counter
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -144,26 +144,26 @@ def synth_photo(card: np.ndarray, rng: random.Random) -> bytes:
     return _render(card, _draw(rng))
 
 
-def _urls(product: CatalogProduct) -> list[str]:
-    """The product's image URLs, the one the bench prefers first."""
-    return [u for u in (product.image_large_url, product.image_url) if u]
+def _images(product: CatalogProduct) -> list[str]:
+    """The product's image paths, the one the bench prefers first."""
+    return [u for u in (product.image_large, product.image) if u]
 
 
 def sample(products: list[CatalogProduct], size: int, seed: int) -> list[CatalogProduct]:
     """Half at random, a quarter from names with 6+ printings, a quarter from names with 2-5; only products with an
-    image URL."""
-    pool = sorted((p for p in products if _urls(p)), key=lambda p: p.id_product)
+    image."""
+    pool = sorted((p for p in products if _images(p)), key=lambda p: p.id)
     size = min(size, len(pool))
     rng = random.Random(seed)
     printings = Counter(p.name.casefold() for p in pool)
     many = [p for p in pool if printings[p.name.casefold()] >= 6]
     few = [p for p in pool if 2 <= printings[p.name.casefold()] <= 5]
-    chosen: dict[int, CatalogProduct] = {}
+    chosen: dict[str, CatalogProduct] = {}
 
     def take(source: list[CatalogProduct], n: int) -> None:
-        free = [p for p in source if p.id_product not in chosen]
+        free = [p for p in source if p.id not in chosen]
         for p in rng.sample(free, min(n, len(free))):
-            chosen[p.id_product] = p
+            chosen[p.id] = p
 
     quarter = size // 4
     take(many, quarter)
@@ -172,35 +172,42 @@ def sample(products: list[CatalogProduct], size: int, seed: int) -> list[Catalog
     return list(chosen.values())
 
 
+def _read(path: Path) -> bytes | None:
+    """The file's bytes if they decode as an image, else None."""
+    try:
+        data = path.read_bytes()
+        return data if decode(data) is not None else None
+    except (OSError, cv2.error):
+        return None
+
+
 def collect(products: list[CatalogProduct], size: int, seed: int,
-            fetch: Callable[[list[str]], dict[str, bytes | None]]) -> tuple[list[tuple[CatalogProduct, bytes]], int]:
+            image_root: Path) -> tuple[list[tuple[CatalogProduct, bytes]], int]:
     """The sampled products with their image bytes, and how many sampled products had to be skipped.
 
-    Only the sampled images are fetched (the large one, else the normal one) with `fetch`, which answers None for
-    an image it can't download or decode; such a product is replaced by another drawn at random from the products not tried yet.
+    Only the sampled images are read from `image_root` (the large one, else the normal one); a product whose images
+    are missing or don't decode is replaced by another drawn at random from the products not tried yet.
     """
-    pool = sorted((p for p in products if _urls(p)), key=lambda p: p.id_product)
+    pool = sorted((p for p in products if _images(p)), key=lambda p: p.id)
     rng = random.Random(seed + 1)
     todo = sample(pool, size, seed)
-    tried = {p.id_product for p in todo}
+    tried = {p.id for p in todo}
     got: list[tuple[CatalogProduct, bytes]] = []
     skipped = 0
     while todo:
-        first = fetch([_urls(p)[0] for p in todo])
-        second = fetch([_urls(p)[1] for p in todo if len(_urls(p)) > 1 and first.get(_urls(p)[0]) is None])
         failed = 0
         for p in todo:
-            data = next((d for u in _urls(p) if (d := first.get(u) or second.get(u))), None)
-            if data is not None:  # `fetch` gives only bytes that decode
+            data = next((d for rel in _images(p) if (d := _read(image_root / rel)) is not None), None)
+            if data is not None:
                 got.append((p, data))
             else:
                 failed += 1
         skipped += failed
-        free = [p for p in pool if p.id_product not in tried]
+        free = [p for p in pool if p.id not in tried]
         todo = rng.sample(free, min(failed, len(free)))
-        tried.update(p.id_product for p in todo)
+        tried.update(p.id for p in todo)
     if skipped:
-        logger.info("bench: skipped %d sampled products whose image could not be fetched or decoded", skipped)
+        logger.info("bench: skipped %d sampled products whose image could not be read or decoded", skipped)
     return got, skipped
 
 
@@ -241,16 +248,16 @@ class Report:
 
 def _outcome(result, product: CatalogProduct) -> str:
     if result.outcome == "ok":
-        return "ok" if result.product_id == product.id_product else "wrong_certain"
+        return "ok" if result.product_id == product.id else "wrong_certain"
     if result.outcome == "no_card":
         return "no_card"
-    return "in_candidates" if product.id_product in result.candidates else "not_found"
+    return "in_candidates" if product.id in result.candidates else "not_found"
 
 
 def _rank(result, product: CatalogProduct) -> str | None:
-    if product.id_product not in result.candidates:
+    if product.id not in result.candidates:
         return None
-    position = result.candidates.index(product.id_product)
+    position = result.candidates.index(product.id)
     return RANKS[0] if position == 0 else RANKS[1] if position < 3 else RANKS[2]
 
 
@@ -261,9 +268,9 @@ def _certain(index: Index) -> Index:
     return out
 
 
-def _without(index: Index, product_id: int) -> Index:
-    for row in reversed(np.flatnonzero(index.ids == product_id)):
-        index = drop_row(index, int(row))
+def _without(index: Index, product_id: str) -> Index:
+    for row in reversed([i for i, id in enumerate(index.ids) if id == product_id]):
+        index = drop_row(index, row)
     return index
 
 
@@ -297,8 +304,8 @@ def run(index: Index, samples: list[tuple[CatalogProduct, bytes]], seed: int, sk
         product, photo = item
         report.total += 1
         for mode in MODES:
-            lock = product.expansion_code or None if mode == "lock" else None
-            target = _without(index, product.id_product) if mode == "unindexed" else index
+            lock = product.set_code or None if mode == "lock" else None
+            target = _without(index, product.id) if mode == "unindexed" else index
             start = time.perf_counter()
             result = recognize(photo, target, lock)
             report.times_ms[mode].append((time.perf_counter() - start) * 1000)

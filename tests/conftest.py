@@ -69,3 +69,17 @@ def photo_of():
         return canvas
 
     return make
+
+
+@pytest.fixture
+def write_card_image(card_image):
+    """Writes the synthetic card `seed` at `path`, in the format of its extension (WebP lossless)."""
+    def write(path, seed: int = 1, image: np.ndarray | None = None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok, data = cv2.imencode(path.suffix, card_image(seed) if image is None else image,
+                                [cv2.IMWRITE_WEBP_QUALITY, 101])
+        assert ok
+        path.write_bytes(data.tobytes())
+        return path
+
+    return write
